@@ -8,9 +8,6 @@
   window.dataLayer = window.dataLayer || [];
   function gtag(){dataLayer.push(arguments);}
   gtag('js', new Date());
-
-  gtag('config', 'G-LB9BJ3JDEN');
-</script>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>IKRA — Professional PDF Editor</title>
@@ -1346,80 +1343,146 @@
       }
     }, { passive: false });
 
-    async function renderPDF() {
+    async function renderPDF(oldData = []) {
       const container = document.getElementById('pdf-container');
       const thumbs = document.getElementById('thumb-sidebar-inner');
-      container.innerHTML = ''; thumbs.innerHTML = ''; pages = []; drawnObjects = [];
 
-      for (let i = 1; i <= pdfDoc.numPages; i++) {
+      // Optimization: If pages exist, reuse them instead of wiping innerHTML
+      const numPages = pdfDoc.numPages;
+      const existingWrappers = container.querySelectorAll('.page-wrapper');
+
+      if (existingWrappers.length !== numPages) {
+        container.innerHTML = '';
+        thumbs.innerHTML = '';
+      }
+
+      pages = []; drawnObjects = [];
+
+      for (let i = 1; i <= numPages; i++) {
         const page = await pdfDoc.getPage(i);
         const viewport = page.getViewport({ scale });
 
-        const wrapper = document.createElement('div');
-        wrapper.className = 'page-wrapper';
-        const pdfCanvas = document.createElement('canvas');
-        pdfCanvas.className = 'pdf-canvas';
+        let wrapper, pdfCanvas, searchCanvas, annotCanvas;
+
+        if (existingWrappers[i - 1]) {
+          wrapper = existingWrappers[i - 1];
+          pdfCanvas = wrapper.querySelector('.pdf-canvas');
+          searchCanvas = wrapper.querySelector('.search-canvas');
+          annotCanvas = wrapper.querySelector('.annot-canvas');
+
+          // Clear text annotations from wrapper
+          wrapper.querySelectorAll('.note-label, .pdf-textbox').forEach(el => el.remove());
+        } else {
+          wrapper = document.createElement('div');
+          wrapper.className = 'page-wrapper';
+          pdfCanvas = document.createElement('canvas');
+          pdfCanvas.className = 'pdf-canvas';
+          searchCanvas = document.createElement('canvas');
+          searchCanvas.className = 'search-canvas';
+          annotCanvas = document.createElement('canvas');
+          annotCanvas.className = 'annot-canvas';
+
+          wrapper.appendChild(pdfCanvas);
+          wrapper.appendChild(searchCanvas);
+          wrapper.appendChild(annotCanvas);
+          container.appendChild(wrapper);
+        }
+
         pdfCanvas.width = viewport.width;
         pdfCanvas.height = viewport.height;
-        const pdfCtx = pdfCanvas.getContext('2d');
-        await page.render({ canvasContext: pdfCtx, viewport }).promise;
+        await page.render({ canvasContext: pdfCanvas.getContext('2d'), viewport }).promise;
 
-        const annotCanvas = document.createElement('canvas');
-        annotCanvas.className = 'annot-canvas';
         annotCanvas.width = viewport.width;
         annotCanvas.height = viewport.height;
         const ctx = annotCanvas.getContext('2d');
-
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
 
-        const searchCanvas = document.createElement('canvas');
-        searchCanvas.className = 'search-canvas';
         searchCanvas.width = viewport.width;
         searchCanvas.height = viewport.height;
         const sCtx = searchCanvas.getContext('2d');
 
-        wrapper.appendChild(pdfCanvas);
-        wrapper.appendChild(searchCanvas);
-        wrapper.appendChild(annotCanvas);
-        container.appendChild(wrapper);
+        // Setup thumbnail (only if it doesn't exist)
+        if (!thumbs.children[i - 1]) {
+          const thumbItem = document.createElement('div');
+          thumbItem.className = 'thumb-item';
+          if (i === 1) thumbItem.classList.add('active');
+          const thumbCanvas = document.createElement('canvas');
+          const thumbScale = 0.25;
+          const thumbVp = page.getViewport({ scale: thumbScale });
+          thumbCanvas.width = thumbVp.width;
+          thumbCanvas.height = thumbVp.height;
+          await page.render({ canvasContext: thumbCanvas.getContext('2d'), viewport: thumbVp }).promise;
+          thumbItem.appendChild(thumbCanvas);
+          const numLabel = document.createElement('div');
+          numLabel.className = 'thumb-num';
+          numLabel.textContent = i;
+          thumbItem.appendChild(numLabel);
+          thumbItem.onclick = () => {
+            document.querySelectorAll('.thumb-item').forEach(t => t.classList.remove('active'));
+            thumbItem.classList.add('active');
+            wrapper.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          };
+          thumbs.appendChild(thumbItem);
+        }
 
-        const thumbItem = document.createElement('div');
-        thumbItem.className = 'thumb-item';
-        if (i === 1) thumbItem.classList.add('active');
-        const thumbCanvas = document.createElement('canvas');
-        const thumbScale = 0.25;
-        const thumbVp = page.getViewport({ scale: thumbScale });
-        thumbCanvas.width = thumbVp.width;
-        thumbCanvas.height = thumbVp.height;
-        await page.render({ canvasContext: thumbCanvas.getContext('2d'), viewport: thumbVp }).promise;
-        thumbItem.appendChild(thumbCanvas);
-        const numLabel = document.createElement('div');
-        numLabel.className = 'thumb-num';
-        numLabel.textContent = i;
-        thumbItem.appendChild(numLabel);
-        thumbItem.onclick = () => {
-          document.querySelectorAll('.thumb-item').forEach(t => t.classList.remove('active'));
-          thumbItem.classList.add('active');
-          wrapper.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        };
-        thumbs.appendChild(thumbItem);
-
-        pages.push({ pdfCanvas, annotCanvas, searchCanvas, ctx, sCtx, wrapper, viewport, pageNum: i, objects: [] });
+        const pageObj = { pdfCanvas, annotCanvas, searchCanvas, ctx, sCtx, wrapper, viewport, pageNum: i, objects: [] };
+        pages.push(pageObj);
         setupAnnotationCanvas(annotCanvas, ctx, i - 1, wrapper, viewport);
 
-        // Extract text for searching
-        const textContent = await page.getTextContent();
-        pdfTextContent[i - 1] = textContent;
+        // Restore annotations
+        if (oldData[i - 1]) {
+          pageObj.objects = oldData[i - 1].objects || [];
+          redrawCanvas(i - 1);
+
+          if (oldData[i - 1].notes) {
+            oldData[i - 1].notes.forEach(n => placeNote(i - 1, n.x * scale, n.y * scale, n.text));
+          }
+          if (oldData[i - 1].textboxes) {
+            oldData[i - 1].textboxes.forEach(tb => placeTextbox(i - 1, tb.x * scale, tb.y * scale, tb.text, tb.color));
+          }
+        }
+
+        // Extract text for searching (only if needed)
+        if (!pdfTextContent[i - 1]) {
+          const textContent = await page.getTextContent();
+          pdfTextContent[i - 1] = textContent;
+        }
       }
     }
 
     async function rerender() {
       if (!pdfDoc) return;
-      await renderPDF();
+
+      const area = document.getElementById('canvas-area');
+      const oldScrollTop = area.scrollTop;
+      const oldScale = scale;
+      const oldPagesData = pages.map(p => ({
+        objects: [...p.objects],
+        // Capture live DOM elements positions/content for persistence
+        notes: Array.from(p.wrapper.querySelectorAll('.note-label')).map(el => ({
+          x: parseFloat(el.style.left) / oldScale,
+          y: parseFloat(el.style.top) / oldScale,
+          text: el.dataset.text
+        })),
+        textboxes: Array.from(p.wrapper.querySelectorAll('.pdf-textbox')).map(el => ({
+          x: parseFloat(el.style.left) / oldScale,
+          y: parseFloat(el.style.top) / oldScale,
+          text: el.textContent,
+          color: el.style.color
+        }))
+      }));
+
+      await renderPDF(oldPagesData);
+
       document.getElementById('zoom-val').textContent = Math.round(scale * 100) + '%';
       updatePageInfo();
       if (document.getElementById('search-input').value) performSearch(document.getElementById('search-input').value);
+
+      // Restore scroll position
+      requestAnimationFrame(() => {
+        area.scrollTop = oldScrollTop * (scale / oldScale);
+      });
     }
 
     function updatePageInfo() {
@@ -1774,24 +1837,29 @@
             tempCtx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
 
             const pos = getPos(canvas, e);
-            const w = pos.x - shapeStartPos.x;
-            const h = pos.y - shapeStartPos.y;
-            const bbox = {
-              x: Math.min(shapeStartPos.x, pos.x),
-              y: Math.min(shapeStartPos.y, pos.y),
-              w: Math.abs(w),
-              h: Math.abs(h)
-            };
+
+            // Normalize ALL shape coordinates to PDF space
+            const pdfStart = screenToPDF(viewport, shapeStartPos.x, shapeStartPos.y);
+            const pdfEnd = screenToPDF(viewport, pos.x, pos.y);
+            const pdfW = Math.abs(pdfEnd.x - pdfStart.x);
+            const pdfH = Math.abs(pdfEnd.y - pdfStart.y);
+            const pdfX = Math.min(pdfStart.x, pdfEnd.x);
+            const pdfY = Math.min(pdfStart.y, pdfEnd.y);
+
             pages[pageIdx].objects.push({
               type: tool,
-              bbox: bbox,
+              // We store normalized PDF coordinates
+              pdfBbox: { x: pdfX, y: pdfY, w: pdfW, h: pdfH },
+              pdfStart: pdfStart,
+              pdfEnd: pdfEnd,
               color: color,
-              lineWidth: brushSize,
+              lineWidth: brushSize, // brushSize is relative to PDF space or scale? 
+              // In this app, brushSize is used directly as lineWidth. 
+              // To keep it consistent across zoom, we should probably store it as PDF-relative or just fixed.
+              // Currently path lineWidth is fixed. I'll stick to that for now but normalize the position.
               fill: document.getElementById('ctx-fill').checked,
               stroke: document.getElementById('ctx-stroke').checked,
-              lineDash: document.getElementById('ctx-linedash').value,
-              start: shapeStartPos ? { ...shapeStartPos } : { x: 0, y: 0 },
-              end: pos ? { ...pos } : { x: 0, y: 0 }
+              lineDash: document.getElementById('ctx-linedash').value
             });
           }
           shapeStartPos = null;
@@ -1839,8 +1907,15 @@
           page.ctx.strokeStyle = obj.color;
           page.ctx.fillStyle = obj.color + '40';
           page.ctx.lineWidth = obj.lineWidth;
-          if (obj.fill) page.ctx.fillRect(obj.bbox.x, obj.bbox.y, obj.bbox.w, obj.bbox.h);
-          if (obj.stroke) page.ctx.strokeRect(obj.bbox.x, obj.bbox.y, obj.bbox.w, obj.bbox.h);
+
+          // Re-project PDF coords to Screen
+          const sX = obj.pdfBbox ? obj.pdfBbox.x * scale : obj.bbox.x;
+          const sY = obj.pdfBbox ? obj.pdfBbox.y * scale : obj.bbox.y;
+          const sW = obj.pdfBbox ? obj.pdfBbox.w * scale : obj.bbox.w;
+          const sH = obj.pdfBbox ? obj.pdfBbox.h * scale : obj.bbox.h;
+
+          if (obj.fill) page.ctx.fillRect(sX, sY, sW, sH);
+          if (obj.stroke) page.ctx.strokeRect(sX, sY, sW, sH);
           page.ctx.restore();
         } else if (obj.type === 'ellipse') {
           page.ctx.save();
@@ -1848,7 +1923,13 @@
           page.ctx.fillStyle = obj.color + '40';
           page.ctx.lineWidth = obj.lineWidth;
           page.ctx.beginPath();
-          page.ctx.ellipse(obj.bbox.x + obj.bbox.w / 2, obj.bbox.y + obj.bbox.h / 2, obj.bbox.w / 2, obj.bbox.h / 2, 0, 0, 2 * Math.PI);
+
+          const sX = obj.pdfBbox ? obj.pdfBbox.x * scale : obj.bbox.x;
+          const sY = obj.pdfBbox ? obj.pdfBbox.y * scale : obj.bbox.y;
+          const sW = obj.pdfBbox ? obj.pdfBbox.w * scale : obj.bbox.w;
+          const sH = obj.pdfBbox ? obj.pdfBbox.h * scale : obj.bbox.h;
+
+          page.ctx.ellipse(sX + sW / 2, sY + sH / 2, Math.abs(sW / 2), Math.abs(sH / 2), 0, 0, 2 * Math.PI);
           if (obj.fill) page.ctx.fill();
           if (obj.stroke) page.ctx.stroke();
           page.ctx.restore();
@@ -1864,18 +1945,21 @@
           else page.ctx.setLineDash([]);
 
           page.ctx.beginPath();
-          page.ctx.moveTo(obj.start.x, obj.start.x === undefined ? 0 : obj.start.y);
-          page.ctx.lineTo(obj.end.x, obj.end.y);
+          const sS = obj.pdfStart ? { x: obj.pdfStart.x * scale, y: obj.pdfStart.y * scale } : obj.start;
+          const sE = obj.pdfEnd ? { x: obj.pdfEnd.x * scale, y: obj.pdfEnd.y * scale } : obj.end;
+
+          page.ctx.moveTo(sS.x, sS.y);
+          page.ctx.lineTo(sE.x, sE.y);
           page.ctx.stroke();
 
           if (obj.type === 'arrow') {
-            const angle = Math.atan2(obj.end.y - obj.start.y, obj.end.x - obj.start.x);
+            const angle = Math.atan2(sE.y - sS.y, sE.x - sS.x);
             const headlen = 15;
             page.ctx.beginPath();
-            page.ctx.moveTo(obj.end.x, obj.end.y);
-            page.ctx.lineTo(obj.end.x - headlen * Math.cos(angle - Math.PI / 6), obj.end.y - headlen * Math.sin(angle - Math.PI / 6));
-            page.ctx.moveTo(obj.end.x, obj.end.y);
-            page.ctx.lineTo(obj.end.x - headlen * Math.cos(angle + Math.PI / 6), obj.end.y - headlen * Math.sin(angle + Math.PI / 6));
+            page.ctx.moveTo(sE.x, sE.y);
+            page.ctx.lineTo(sE.x - headlen * Math.cos(angle - Math.PI / 6), sE.y - headlen * Math.sin(angle - Math.PI / 6));
+            page.ctx.moveTo(sE.x, sE.y);
+            page.ctx.lineTo(sE.x - headlen * Math.cos(angle + Math.PI / 6), sE.y - headlen * Math.sin(angle + Math.PI / 6));
             page.ctx.stroke();
           }
           page.ctx.restore();
@@ -1941,13 +2025,13 @@
       };
     }
 
-    function placeTextbox(pageIdx, x, y, txt = '') {
+    function placeTextbox(pageIdx, x, y, txt = '', tbColor = color) {
       const tb = document.createElement('div');
       tb.className = 'pdf-textbox';
       tb.contentEditable = true;
       tb.style.left = x + 'px';
       tb.style.top = y + 'px';
-      tb.style.color = color;
+      tb.style.color = tbColor;
       tb.textContent = txt;
       pages[pageIdx].wrapper.appendChild(tb);
 
@@ -2378,6 +2462,5 @@
     }
   </script>
 </body>
-
 
 </html>
