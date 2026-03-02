@@ -5,9 +5,13 @@
   <!-- Google tag (gtag.js) -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-LB9BJ3JDEN"></script>
 <script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
+
+&nbsp; window.dataLayer = window.dataLayer || \[];
+
+&nbsp; function gtag(){dataLayer.push(arguments);}
+
+&nbsp; gtag('js', new Date());
+
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>IKRA — Professional PDF Editor</title>
@@ -72,6 +76,9 @@
       gap: 8px;
       flex-shrink: 0;
       z-index: 200;
+      transform: translateZ(0);
+      backface-visibility: hidden;
+      will-change: transform;
     }
 
     .logo {
@@ -376,6 +383,9 @@
       position: relative;
       z-index: 100;
       overflow: visible;
+      transform: translateZ(0);
+      backface-visibility: hidden;
+      will-change: transform, width;
     }
 
     #toolbar.collapsed {
@@ -598,13 +608,19 @@
       flex-direction: column;
       align-items: center;
       gap: 16px;
-      position: relative
+      position: relative;
+      transform-origin: 0 0;
+      transition: transform 0.12s ease-out;
+      will-change: transform;
     }
 
     .page-wrapper {
       position: relative;
       border-radius: 3px;
-      box-shadow: 0 2px 16px rgba(0, 0, 0, .18), 0 8px 40px rgba(0, 0, 0, .12)
+      box-shadow: 0 2px 16px rgba(0, 0, 0, .18), 0 8px 40px rgba(0, 0, 0, .12);
+      transform: translateZ(0);
+      backface-visibility: hidden;
+      will-change: transform;
     }
 
     .pdf-canvas {
@@ -1298,6 +1314,7 @@
     let searchMatches = [];
     let currentMatchIdx = -1;
     let pdfTextContent = [];
+    let undoStack = []; // Action history for undo
 
     function loadFile(file) {
       if (!file || file.type !== 'application/pdf') return;
@@ -1336,18 +1353,55 @@
     canvasArea.addEventListener('wheel', e => {
       if (e.ctrlKey) {
         e.preventDefault();
-        scale -= e.deltaY * 0.002;
-        scale = Math.min(Math.max(scale, 0.4), 5);
+        const rect = canvasArea.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+
+        const currentVisualFactor = scale / visualBaseScale;
+        const worldX = (mouseX + canvasArea.scrollLeft) / currentVisualFactor;
+        const worldY = (mouseY + canvasArea.scrollTop) / currentVisualFactor;
+
+        const zoomIntensity = 0.12;
+        const factor = e.deltaY > 0 ? (1 / (1 + zoomIntensity)) : (1 + zoomIntensity);
+        scale *= factor;
+        scale = Math.min(Math.max(scale, 0.4), 8);
+
+        const visualFactor = scale / visualBaseScale;
+        const pdfContainer = document.getElementById('pdf-container');
+        pdfContainer.style.transform = `scale(${visualFactor})`;
+
+        canvasArea.scrollLeft = worldX * visualFactor - mouseX;
+        canvasArea.scrollTop = worldY * visualFactor - mouseY;
+
         clearTimeout(window.zoomDebounce);
-        window.zoomDebounce = setTimeout(() => rerender(), 80);
+        window.zoomDebounce = setTimeout(() => rerender(), 400);
       }
     }, { passive: false });
+
+    let visualBaseScale = scale;
+
+    document.getElementById('zoom-in').onclick = () => {
+      scale = Math.min(scale + 0.2, 5);
+      applyVisualZoom();
+    };
+    document.getElementById('zoom-out').onclick = () => {
+      scale = Math.max(scale - 0.2, 0.4);
+      applyVisualZoom();
+    };
+
+    function applyVisualZoom() {
+      const pdfContainer = document.getElementById('pdf-container');
+      const visualFactor = scale / visualBaseScale;
+      pdfContainer.style.transform = `scale(${visualFactor})`;
+
+      clearTimeout(window.zoomDebounce);
+      window.zoomDebounce = setTimeout(() => rerender(), 400);
+    }
 
     async function renderPDF(oldData = []) {
       const container = document.getElementById('pdf-container');
       const thumbs = document.getElementById('thumb-sidebar-inner');
 
-      // Optimization: If pages exist, reuse them instead of wiping innerHTML
       const numPages = pdfDoc.numPages;
       const existingWrappers = container.querySelectorAll('.page-wrapper');
 
@@ -1369,8 +1423,6 @@
           pdfCanvas = wrapper.querySelector('.pdf-canvas');
           searchCanvas = wrapper.querySelector('.search-canvas');
           annotCanvas = wrapper.querySelector('.annot-canvas');
-
-          // Clear text annotations from wrapper
           wrapper.querySelectorAll('.note-label, .pdf-textbox').forEach(el => el.remove());
         } else {
           wrapper = document.createElement('div');
@@ -1388,21 +1440,7 @@
           container.appendChild(wrapper);
         }
 
-        pdfCanvas.width = viewport.width;
-        pdfCanvas.height = viewport.height;
-        await page.render({ canvasContext: pdfCanvas.getContext('2d'), viewport }).promise;
-
-        annotCanvas.width = viewport.width;
-        annotCanvas.height = viewport.height;
-        const ctx = annotCanvas.getContext('2d');
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
-
-        searchCanvas.width = viewport.width;
-        searchCanvas.height = viewport.height;
-        const sCtx = searchCanvas.getContext('2d');
-
-        // Setup thumbnail (only if it doesn't exist)
+        // Setup thumbnail
         if (!thumbs.children[i - 1]) {
           const thumbItem = document.createElement('div');
           thumbItem.className = 'thumb-item';
@@ -1421,10 +1459,23 @@
           thumbItem.onclick = () => {
             document.querySelectorAll('.thumb-item').forEach(t => t.classList.remove('active'));
             thumbItem.classList.add('active');
-            wrapper.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            wrapper.scrollIntoView({ behavior: 'smooth', block: 'start' });
           };
           thumbs.appendChild(thumbItem);
         }
+
+        pdfCanvas.width = viewport.width;
+        pdfCanvas.height = viewport.height;
+        await page.render({ canvasContext: pdfCanvas.getContext('2d'), viewport }).promise;
+
+        annotCanvas.width = viewport.width;
+        annotCanvas.height = viewport.height;
+        const ctx = annotCanvas.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
+
+        searchCanvas.width = viewport.width;
+        searchCanvas.height = viewport.height;
+        const sCtx = searchCanvas.getContext('2d');
 
         const pageObj = { pdfCanvas, annotCanvas, searchCanvas, ctx, sCtx, wrapper, viewport, pageNum: i, objects: [] };
         pages.push(pageObj);
@@ -1434,7 +1485,6 @@
         if (oldData[i - 1]) {
           pageObj.objects = oldData[i - 1].objects || [];
           redrawCanvas(i - 1);
-
           if (oldData[i - 1].notes) {
             oldData[i - 1].notes.forEach(n => placeNote(i - 1, n.x * scale, n.y * scale, n.text));
           }
@@ -1443,7 +1493,6 @@
           }
         }
 
-        // Extract text for searching (only if needed)
         if (!pdfTextContent[i - 1]) {
           const textContent = await page.getTextContent();
           pdfTextContent[i - 1] = textContent;
@@ -1451,15 +1500,37 @@
       }
     }
 
+    window.addEventListener('keydown', e => {
+      if (e.ctrlKey && e.key === 'z') {
+        e.preventDefault();
+        undo();
+      }
+    });
+
+    function undo() {
+      if (undoStack.length === 0) return;
+      const action = undoStack.pop();
+      if (action.type === 'object') {
+        const p = pages[action.pageIdx];
+        p.objects = p.objects.filter(obj => obj.id !== action.objId);
+        redrawCanvas(action.pageIdx);
+      } else if (action.type === 'dom') {
+        action.element.remove();
+      }
+      toast('↺', 'Undone');
+    }
+
     async function rerender() {
       if (!pdfDoc) return;
 
       const area = document.getElementById('canvas-area');
+      const pdfContainer = document.getElementById('pdf-container');
       const oldScrollTop = area.scrollTop;
-      const oldScale = scale;
+      const oldScrollLeft = area.scrollLeft;
+      const oldScale = visualBaseScale;
+
       const oldPagesData = pages.map(p => ({
         objects: [...p.objects],
-        // Capture live DOM elements positions/content for persistence
         notes: Array.from(p.wrapper.querySelectorAll('.note-label')).map(el => ({
           x: parseFloat(el.style.left) / oldScale,
           y: parseFloat(el.style.top) / oldScale,
@@ -1473,15 +1544,21 @@
         }))
       }));
 
+      // Reset visual scaling before high-quality render
+      pdfContainer.style.transition = 'none';
+      pdfContainer.style.transform = 'scale(1)';
+      visualBaseScale = scale;
+
       await renderPDF(oldPagesData);
 
+      pdfContainer.style.transition = 'transform 0.1s ease-out';
       document.getElementById('zoom-val').textContent = Math.round(scale * 100) + '%';
       updatePageInfo();
       if (document.getElementById('search-input').value) performSearch(document.getElementById('search-input').value);
 
-      // Restore scroll position
       requestAnimationFrame(() => {
         area.scrollTop = oldScrollTop * (scale / oldScale);
+        area.scrollLeft = oldScrollLeft * (scale / oldScale);
       });
     }
 
@@ -1820,7 +1897,9 @@
             }
 
             const bbox = calculateBoundingBox(savePoints, lineWidth);
+            const objId = Date.now() + Math.random();
             pages[pageIdx].objects.push({
+              id: objId,
               type: tool,
               points: savePoints.map(p => screenToPDF(viewport, p.x, p.y)),
               bbox: bbox,
@@ -1828,6 +1907,7 @@
               lineWidth: lineWidth,
               alpha: tool === 'highlight' ? brushOpacity : 1.0
             });
+            undoStack.push({ type: 'object', pageIdx, objId });
           }
           points = [];
           straightLineMode = false;
@@ -1846,7 +1926,9 @@
             const pdfX = Math.min(pdfStart.x, pdfEnd.x);
             const pdfY = Math.min(pdfStart.y, pdfEnd.y);
 
+            const objId = Date.now() + Math.random();
             pages[pageIdx].objects.push({
+              id: objId,
               type: tool,
               // We store normalized PDF coordinates
               pdfBbox: { x: pdfX, y: pdfY, w: pdfW, h: pdfH },
@@ -1861,6 +1943,7 @@
               stroke: document.getElementById('ctx-stroke').checked,
               lineDash: document.getElementById('ctx-linedash').value
             });
+            undoStack.push({ type: 'object', pageIdx, objId });
           }
           shapeStartPos = null;
         }
@@ -2000,6 +2083,7 @@
       note.dataset.text = text;
       note.title = text;
       pages[pageIdx].wrapper.appendChild(note);
+      undoStack.push({ type: 'dom', element: note });
 
       setupDraggable(note);
 
@@ -2034,6 +2118,7 @@
       tb.style.color = tbColor;
       tb.textContent = txt;
       pages[pageIdx].wrapper.appendChild(tb);
+      undoStack.push({ type: 'dom', element: tb });
 
       setupDraggable(tb);
 
@@ -2105,8 +2190,7 @@
     document.getElementById('brush-size').oninput = e => { brushSize = parseFloat(e.target.value) };
     document.getElementById('brush-opacity').oninput = e => { brushOpacity = parseFloat(e.target.value) };
 
-    document.getElementById('zoom-in').onclick = () => { scale = Math.min(scale + 0.25, 5); rerender() };
-    document.getElementById('zoom-out').onclick = () => { scale = Math.max(scale - 0.25, 0.4); rerender() };
+    // Unified listeners are defined above
 
     document.getElementById('thumb-toggle').onclick = () => {
       document.getElementById('thumb-sidebar').classList.toggle('open');
@@ -2462,6 +2546,5 @@
     }
   </script>
 </body>
-
 
 </html>
