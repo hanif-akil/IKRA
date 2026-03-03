@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Graph Plotter | IKRA PDF Tools</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --accent-color: #38bdf8;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --glass-border: rgba(255, 255, 255, 0.1);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg-color);
+            background-image:
+                radial-gradient(circle at 20% 20%, rgba(56, 189, 248, 0.15) 0%, transparent 25%),
+                radial-gradient(circle at 80% 80%, rgba(139, 92, 246, 0.1) 0%, transparent 25%);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+        }
+
+        .container {
+            max-width: 1450px;
+            width: 100%;
+        }
+
+        header {
+            margin-bottom: 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            width: 100%;
+        }
+
+        .back-link {
+            color: var(--text-secondary);
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            transition: color 0.3s ease;
+        }
+
+        .back-link:hover {
+            color: var(--accent-color);
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #fff 0%, #38bdf8 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .tool-layout {
+            display: grid;
+            grid-template-columns: 380px 1fr;
+            gap: 2rem;
+        }
+
+        .card {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            padding: 2rem;
+        }
+
+        .input-group {
+            margin-bottom: 1.25rem;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 0.4rem;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        textarea,
+        input[type="text"],
+        select {
+            width: 100%;
+            background: rgba(15, 23, 42, 0.5);
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            color: var(--text-primary);
+            padding: 0.75rem 1rem;
+            font-family: inherit;
+            font-size: 0.9rem;
+            transition: border-color 0.3s ease;
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 100px;
+        }
+
+        textarea:focus,
+        input[type="text"]:focus,
+        select:focus {
+            outline: none;
+            border-color: var(--accent-color);
+        }
+
+        select option {
+            background: #1e293b;
+            color: var(--text-primary);
+        }
+
+        .btn {
+            width: 100%;
+            padding: 0.85rem;
+            border-radius: 12px;
+            border: none;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+
+        .btn-primary {
+            background: var(--accent-color);
+            color: #000;
+        }
+
+        .btn-primary:hover {
+            background: #7dd3fc;
+            box-shadow: 0 0 20px rgba(56, 189, 248, 0.3);
+        }
+
+        .btn-secondary {
+            background: rgba(148, 163, 184, 0.15);
+            color: var(--text-primary);
+            border: 1px solid var(--glass-border);
+            margin-top: 0.75rem;
+        }
+
+        .btn-secondary:hover {
+            background: rgba(148, 163, 184, 0.3);
+            border-color: var(--accent-color);
+        }
+
+        .chart-card {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .chart-container {
+            position: relative;
+            height: 380px;
+            width: 100%;
+            flex-grow: 1;
+        }
+
+        .chart-toolbar {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .chart-toolbar .btn {
+            width: auto;
+            flex: 1;
+            padding: 0.6rem 1rem;
+            font-size: 0.85rem;
+        }
+
+        .hover-info {
+            margin-top: 0.75rem;
+            padding: 0.6rem 1rem;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid var(--glass-border);
+            border-radius: 10px;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            min-height: 2.2rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .hover-info span {
+            color: var(--accent-color);
+            font-weight: 600;
+        }
+
+        .section-title {
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--accent-color);
+            margin-bottom: 0.75rem;
+            margin-top: 0.5rem;
+        }
+
+        .divider {
+            height: 1px;
+            background: var(--glass-border);
+            margin: 1rem 0;
+        }
+
+        .row-inputs {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.75rem;
+        }
+
+        .row-inputs-3 {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 0.75rem;
+        }
+
+        .instructions {
+            margin-top: 1rem;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        @media (max-width: 900px) {
+            .tool-layout {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <header>
+            <a href="index.html" class="back-link">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="19" y1="12" x2="5" y2="12" />
+                    <polyline points="12 19 5 12 12 5" />
+                </svg>
+                Back to Dashboard
+            </a>
+            <h1>Graph Plotter</h1>
+        </header>
+
+        <div class="tool-layout">
+            <div class="card">
+                <!-- Graph Labels -->
+                <div class="section-title">Graph Labels</div>
+                <div class="input-group">
+                    <label for="graphTitle">Graph Title</label>
+                    <input type="text" id="graphTitle" placeholder="e.g. Frequency vs Amplitude">
+                </div>
+                <div class="row-inputs">
+                    <div class="input-group">
+                        <label for="xLabel">X-Axis Label</label>
+                        <input type="text" id="xLabel" placeholder="e.g. Frequency (Hz)">
+                    </div>
+                    <div class="input-group">
+                        <label for="yLabel">Y-Axis Label</label>
+                        <input type="text" id="yLabel" placeholder="e.g. Amplitude">
+                    </div>
+                </div>
+
+                <div class="divider"></div>
+
+                <!-- Data Entry -->
+                <div class="section-title">Data Entry</div>
+                <div class="input-group">
+                    <label for="xValues">X Values (comma or newline separated)</label>
+                    <textarea id="xValues" placeholder="e.g. 1, 10, 100, 1000">1, 10, 100, 1000</textarea>
+                </div>
+                <div class="input-group">
+                    <label for="yValues">Y Values (comma or newline separated)</label>
+                    <textarea id="yValues" placeholder="e.g. 2, 20, 200, 2000">2, 20, 200, 2000</textarea>
+                </div>
+
+                <div class="divider"></div>
+
+                <!-- Plot Options -->
+                <div class="section-title">Plot Options</div>
+                <div class="row-inputs">
+                    <div class="input-group">
+                        <label for="trendType">Trendline</label>
+                        <select id="trendType">
+                            <option value="none">None (connect points)</option>
+                            <option value="power">Best Fit (Power)</option>
+                            <option value="linear">Linear Regression</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label for="plotBg">Plot Background</label>
+                        <select id="plotBg">
+                            <option value="default">Default (Dark)</option>
+                            <option value="white">White</option>
+                            <option value="black">Black</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="row-inputs">
+                    <div class="input-group">
+                        <label for="xScaleType">X-Axis Scale</label>
+                        <select id="xScaleType">
+                            <option value="logarithmic" selected>Logarithmic (Log)</option>
+                            <option value="linear">Linear (Normal)</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label for="yScaleType">Y-Axis Scale</label>
+                        <select id="yScaleType">
+                            <option value="logarithmic" selected>Logarithmic (Log)</option>
+                            <option value="linear">Linear (Normal)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="row-inputs-3">
+                    <div class="input-group">
+                        <label for="lineWidth">Line Width</label>
+                        <select id="lineWidth">
+                            <option value="1">1 px</option>
+                            <option value="2" selected>2 px</option>
+                            <option value="3">3 px</option>
+                            <option value="4">4 px</option>
+                            <option value="5">5 px</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label for="lineStyle">Line Style</label>
+                        <select id="lineStyle">
+                            <option value="solid">Solid ───</option>
+                            <option value="dashed">Dashed - - -</option>
+                            <option value="dotted">Dotted · · ·</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label for="trendLineStyle">Trend Style</label>
+                        <select id="trendLineStyle">
+                            <option value="dashed" selected>Dashed - - -</option>
+                            <option value="solid">Solid ───</option>
+                            <option value="dotted">Dotted · · ·</option>
+                        </select>
+                    </div>
+                </div>
+
+                <button class="btn btn-primary" onclick="updatePlot()">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M3 3v18h18" />
+                        <path d="m19 9-5 5-4-4-3 3" />
+                    </svg>
+                    Plot Data
+                </button>
+
+                <button class="btn btn-secondary" onclick="saveAsImage()">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="7 10 12 15 17 10" />
+                        <line x1="12" y1="15" x2="12" y2="3" />
+                    </svg>
+                    Save Graph as Image
+                </button>
+
+                <div class="instructions">
+                    <p>Enter positive numeric values. Hover over the graph to see interpolated values on the curve.
+                        Choose a trendline type to fit your data.</p>
+                </div>
+            </div>
+
+            <div class="card chart-card">
+                <div class="chart-container">
+                    <canvas id="logChart"></canvas>
+                </div>
+                <div class="hover-info" id="hoverInfo">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10" />
+                        <line x1="12" y1="16" x2="12" y2="12" />
+                        <line x1="12" y1="8" x2="12.01" y2="8" />
+                    </svg>
+                    Hover over the graph to see point values
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let chartInstance = null;
+        let currentDataPoints = [];
+        let trendlineCoeffs = null; // { type, a, b }
+
+        function getPlotBgConfig() {
+            const bg = document.getElementById('plotBg').value;
+            if (bg === 'white') {
+                return {
+                    chartBg: '#ffffff',
+                    gridColor: 'rgba(0, 0, 0, 0.1)',
+                    tickColor: '#333333',
+                    titleColor: '#333333',
+                    legendColor: '#333333',
+                    tooltipBg: 'rgba(255,255,255,0.95)',
+                    tooltipTitle: '#38bdf8',
+                    tooltipBody: '#333',
+                    tooltipBorder: 'rgba(56, 189, 248, 0.3)',
+                    crosshairColor: 'rgba(0,0,0,0.3)'
+                };
+            } else if (bg === 'black') {
+                return {
+                    chartBg: '#000000',
+                    gridColor: 'rgba(255, 255, 255, 0.08)',
+                    tickColor: '#aaaaaa',
+                    titleColor: '#cccccc',
+                    legendColor: '#cccccc',
+                    tooltipBg: 'rgba(0,0,0,0.9)',
+                    tooltipTitle: '#38bdf8',
+                    tooltipBody: '#f8fafc',
+                    tooltipBorder: 'rgba(56, 189, 248, 0.3)',
+                    crosshairColor: 'rgba(255,255,255,0.3)'
+                };
+            } else {
+                return {
+                    chartBg: 'transparent',
+                    gridColor: 'rgba(255, 255, 255, 0.05)',
+                    tickColor: '#94a3b8',
+                    titleColor: '#94a3b8',
+                    legendColor: '#f8fafc',
+                    tooltipBg: 'rgba(15, 23, 42, 0.9)',
+                    tooltipTitle: '#38bdf8',
+                    tooltipBody: '#f8fafc',
+                    tooltipBorder: 'rgba(56, 189, 248, 0.3)',
+                    crosshairColor: 'rgba(148, 163, 184, 0.4)'
+                };
+            }
+        }
+
+        // Crosshair plugin for hover tracking
+        const crosshairPlugin = {
+            id: 'crosshair',
+            afterDraw(chart) {
+                if (chart._crosshair) {
+                    const { x, y } = chart._crosshair;
+                    const ctx = chart.ctx;
+                    const area = chart.chartArea;
+                    const cfg = getPlotBgConfig();
+
+                    ctx.save();
+                    ctx.setLineDash([4, 4]);
+                    ctx.lineWidth = 1;
+                    ctx.strokeStyle = cfg.crosshairColor;
+
+                    // Vertical line
+                    ctx.beginPath();
+                    ctx.moveTo(x, area.top);
+                    ctx.lineTo(x, area.bottom);
+                    ctx.stroke();
+
+                    // Horizontal line
+                    ctx.beginPath();
+                    ctx.moveTo(area.left, y);
+                    ctx.lineTo(area.right, y);
+                    ctx.stroke();
+
+                    // Draw a dot at the intersection
+                    ctx.setLineDash([]);
+                    ctx.beginPath();
+                    ctx.arc(x, y, 4, 0, Math.PI * 2);
+                    ctx.fillStyle = '#38bdf8';
+                    ctx.fill();
+                    ctx.strokeStyle = '#fff';
+                    ctx.lineWidth = 1.5;
+                    ctx.stroke();
+
+                    ctx.restore();
+                }
+            }
+        };
+
+        // Background plugin for chart area
+        const bgPlugin = {
+            id: 'chartAreaBg',
+            beforeDraw(chart) {
+                const bg = document.getElementById('plotBg').value;
+                if (bg === 'default') return;
+                const ctx = chart.ctx;
+                const area = chart.chartArea;
+                ctx.save();
+                ctx.fillStyle = bg === 'white' ? '#ffffff' : '#000000';
+                ctx.fillRect(area.left, area.top, area.right - area.left, area.bottom - area.top);
+                ctx.restore();
+            }
+        };
+
+        Chart.register(crosshairPlugin, bgPlugin);
+
+        // Compute power-law fit: y = a * x^b  =>  ln(y) = ln(a) + b*ln(x)
+        function powerFit(points) {
+            const n = points.length;
+            let sumLnX = 0, sumLnY = 0, sumLnXLnY = 0, sumLnX2 = 0;
+            for (const p of points) {
+                const lx = Math.log(p.x), ly = Math.log(p.y);
+                sumLnX += lx;
+                sumLnY += ly;
+                sumLnXLnY += lx * ly;
+                sumLnX2 += lx * lx;
+            }
+            const b = (n * sumLnXLnY - sumLnX * sumLnY) / (n * sumLnX2 - sumLnX * sumLnX);
+            const a = Math.exp((sumLnY - b * sumLnX) / n);
+            return { a, b };
+        }
+
+        // Compute linear fit on log-log: log(y) = m*log(x) + c  (same as power in log space)
+        function linearFitLogLog(points) {
+            const n = points.length;
+            let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+            for (const p of points) {
+                const lx = Math.log10(p.x), ly = Math.log10(p.y);
+                sumX += lx;
+                sumY += ly;
+                sumXY += lx * ly;
+                sumX2 += lx * lx;
+            }
+            const m = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+            const c = (sumY - m * sumX) / n;
+            return { m, c }; // log10(y) = m * log10(x) + c
+        }
+
+        function generateTrendlineData(points, type) {
+            if (type === 'none' || points.length < 2) return null;
+
+            const minX = points[0].x;
+            const maxX = points[points.length - 1].x;
+            const logMin = Math.log10(minX);
+            const logMax = Math.log10(maxX);
+            const steps = 80;
+            const result = [];
+
+            if (type === 'power') {
+                const fit = powerFit(points);
+                trendlineCoeffs = { type: 'power', a: fit.a, b: fit.b };
+                for (let i = 0; i <= steps; i++) {
+                    const logX = logMin + (logMax - logMin) * i / steps;
+                    const x = Math.pow(10, logX);
+                    const y = fit.a * Math.pow(x, fit.b);
+                    result.push({ x, y });
+                }
+            } else if (type === 'linear') {
+                const fit = linearFitLogLog(points);
+                trendlineCoeffs = { type: 'linear', m: fit.m, c: fit.c };
+                for (let i = 0; i <= steps; i++) {
+                    const logX = logMin + (logMax - logMin) * i / steps;
+                    const x = Math.pow(10, logX);
+                    const logY = fit.m * logX + fit.c;
+                    const y = Math.pow(10, logY);
+                    result.push({ x, y });
+                }
+            }
+
+            return result;
+        }
+
+        // Get interpolated Y for a given X on the current curve
+        function getInterpolatedY(xVal) {
+            const trendType = document.getElementById('trendType').value;
+            const xScaleType = document.getElementById('xScaleType').value;
+            const yScaleType = document.getElementById('yScaleType').value;
+
+            if (trendType !== 'none' && trendlineCoeffs) {
+                if (trendlineCoeffs.type === 'power') {
+                    return trendlineCoeffs.a * Math.pow(xVal, trendlineCoeffs.b);
+                } else if (trendlineCoeffs.type === 'linear') {
+                    const logX = xScaleType === 'logarithmic' ? Math.log10(xVal) : xVal;
+                    const logY = trendlineCoeffs.m * logX + trendlineCoeffs.c;
+                    return yScaleType === 'logarithmic' ? Math.pow(10, logY) : logY;
+                }
+            }
+
+            // Interpolate between data points
+            if (currentDataPoints.length < 2) return null;
+            if (xVal <= currentDataPoints[0].x) return currentDataPoints[0].y;
+            if (xVal >= currentDataPoints[currentDataPoints.length - 1].x) return currentDataPoints[currentDataPoints.length - 1].y;
+
+            for (let i = 0; i < currentDataPoints.length - 1; i++) {
+                const p1 = currentDataPoints[i];
+                const p2 = currentDataPoints[i + 1];
+                if (xVal >= p1.x && xVal <= p2.x) {
+                    if (xScaleType === 'logarithmic' && yScaleType === 'logarithmic') {
+                        // Log-Log interpolation
+                        const logX1 = Math.log(p1.x), logX2 = Math.log(p2.x);
+                        const logY1 = Math.log(p1.y), logY2 = Math.log(p2.y);
+                        if (logX1 === logX2) return p1.y;
+                        const t = (Math.log(xVal) - logX1) / (logX2 - logX1);
+                        return Math.exp(logY1 + t * (logY2 - logY1));
+                    } else if (xScaleType === 'linear' && yScaleType === 'linear') {
+                        // Linear-Linear interpolation
+                        if (p1.x === p2.x) return p1.y;
+                        const t = (xVal - p1.x) / (p2.x - p1.x);
+                        return p1.y + t * (p2.y - p1.y);
+                    } else if (xScaleType === 'logarithmic' && yScaleType === 'linear') {
+                        // Log-linear (X is log, Y is linear)
+                        const logX1 = Math.log(p1.x), logX2 = Math.log(p2.x);
+                        if (logX1 === logX2) return p1.y;
+                        const t = (Math.log(xVal) - logX1) / (logX2 - logX1);
+                        return p1.y + t * (p2.y - p1.y);
+                    } else {
+                        // Linear-log (X is linear, Y is log)
+                        const logY1 = Math.log(p1.y), logY2 = Math.log(p2.y);
+                        if (p1.x === p2.x) return p1.y;
+                        const t = (xVal - p1.x) / (p2.x - p1.x);
+                        return Math.exp(logY1 + t * (logY2 - logY1));
+                    }
+                }
+            }
+            return null;
+        }
+
+        function updatePlot() {
+            const xValText = document.getElementById('xValues').value;
+            const yValText = document.getElementById('yValues').value;
+
+            const xData = xValText.split(/[\s,]+/).filter(v => v !== '').map(v => parseFloat(v));
+            const yData = yValText.split(/[\s,]+/).filter(v => v !== '').map(v => parseFloat(v));
+
+            if (xData.length !== yData.length) {
+                alert("Number of X and Y values must match!");
+                return;
+            }
+
+            const trendType = document.getElementById('trendType').value;
+            const xScaleType = document.getElementById('xScaleType').value;
+            const yScaleType = document.getElementById('yScaleType').value;
+
+            if (xScaleType === 'logarithmic' && (xData.some(v => v <= 0) || yData.some(v => v <= 0))) {
+                alert("Logarithmic scales require positive values (> 0)!");
+                return;
+            }
+
+            if (yScaleType === 'logarithmic' && yData.some(v => v <= 0)) {
+                alert("Logarithmic scales require positive values (> 0)!");
+                return;
+            }
+
+            const dataPoints = xData.map((x, i) => ({ x: x, y: yData[i] }));
+            dataPoints.sort((a, b) => a.x - b.x);
+            currentDataPoints = dataPoints;
+            // Trendline fitting only valid on log-log; disable otherwise
+            const canFit = xScaleType === 'logarithmic' && yScaleType === 'logarithmic';
+            const trendData = canFit ? generateTrendlineData(dataPoints, trendType) : null;
+
+            const xLabel = document.getElementById('xLabel').value || (xScaleType === 'logarithmic' ? 'X Axis (Log)' : 'X Axis');
+            const yLabel = document.getElementById('yLabel').value || (yScaleType === 'logarithmic' ? 'Y Axis (Log)' : 'Y Axis');
+            const graphTitle = document.getElementById('graphTitle').value || '';
+
+            const cfg = getPlotBgConfig();
+
+            const ctx = document.getElementById('logChart').getContext('2d');
+
+            if (chartInstance) {
+                chartInstance.destroy();
+            }
+
+            const lineWidth = parseInt(document.getElementById('lineWidth').value);
+            const lineStyle = document.getElementById('lineStyle').value;
+            const trendLineStyle = document.getElementById('trendLineStyle').value;
+
+            const getDash = (style) => {
+                if (style === 'dashed') return [8, 4];
+                if (style === 'dotted') return [2, 3];
+                return [];
+            };
+
+            const datasets = [{
+                label: graphTitle || 'Log-Log Data',
+                data: dataPoints,
+                borderColor: '#38bdf8',
+                backgroundColor: 'rgba(56, 189, 248, 0.5)',
+                showLine: trendType === 'none',
+                borderWidth: lineWidth,
+                borderDash: getDash(lineStyle),
+                tension: 0.2,
+                pointRadius: 6,
+                pointHoverRadius: 9,
+                pointBackgroundColor: '#38bdf8',
+                pointBorderColor: '#fff',
+                pointBorderWidth: 1.5,
+                order: 1
+            }];
+
+            if (trendData) {
+                datasets.push({
+                    label: trendType === 'power' ? 'Best Fit (Power)' : 'Linear Regression',
+                    data: trendData,
+                    borderColor: '#f472b6',
+                    backgroundColor: 'transparent',
+                    showLine: true,
+                    borderWidth: lineWidth,
+                    borderDash: getDash(trendLineStyle),
+                    tension: 0.3,
+                    pointRadius: 0,
+                    pointHoverRadius: 0,
+                    order: 2
+                });
+            }
+
+            chartInstance = new Chart(ctx, {
+                type: 'scatter',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'nearest',
+                        axis: 'x',
+                        intersect: false
+                    },
+                    onHover: (event, elements, chart) => {
+                        const area = chart.chartArea;
+                        if (!event.native) return;
+                        const rect = chart.canvas.getBoundingClientRect();
+                        const mouseX = event.native.clientX - rect.left;
+                        const mouseY = event.native.clientY - rect.top;
+
+                        if (mouseX < area.left || mouseX > area.right || mouseY < area.top || mouseY > area.bottom) {
+                            chart._crosshair = null;
+                            chart.draw();
+                            document.getElementById('hoverInfo').innerHTML = `
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="12" r="10"/>
+                                    <line x1="12" y1="16" x2="12" y2="12"/>
+                                    <line x1="12" y1="8" x2="12.01" y2="8"/>
+                                </svg>
+                                Hover over the graph to see point values`;
+                            return;
+                        }
+
+                        const xScale = chart.scales.x;
+                        const yScale = chart.scales.y;
+                        const xVal = xScale.getValueForPixel(mouseX);
+                        const yVal = getInterpolatedY(xVal);
+
+                        if (yVal !== null) {
+                            const pixelY = yScale.getPixelForValue(yVal);
+                            const pixelX = xScale.getPixelForValue(xVal);
+                            chart._crosshair = { x: pixelX, y: pixelY };
+                            chart.draw();
+
+                            const xDisp = xVal < 0.01 || xVal >= 1e6 ? xVal.toExponential(3) : parseFloat(xVal.toPrecision(4));
+                            const yDisp = yVal < 0.01 || yVal >= 1e6 ? yVal.toExponential(3) : parseFloat(yVal.toPrecision(4));
+
+                            document.getElementById('hoverInfo').innerHTML = `
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"/>
+                                        <path d="m9 12 2 2 4-4"/>
+                                    </svg>
+                                    X: <span>${xDisp}</span> &nbsp;│&nbsp; Y: <span>${yDisp}</span>`;
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: xScaleType,
+                            title: {
+                                display: true,
+                                text: xLabel,
+                                color: cfg.titleColor,
+                                font: { size: 14, weight: '600' }
+                            },
+                            grid: {
+                                color: (context) => {
+                                    if (xScaleType === 'logarithmic' && context.tick && context.tick.major) {
+                                        return 'rgba(239, 68, 68, 0.7)'; // red for major (powers of 10)
+                                    }
+                                    return cfg.gridColor;
+                                },
+                                lineWidth: (context) => {
+                                    if (xScaleType === 'logarithmic' && context.tick && context.tick.major) return 1.5;
+                                    return 1;
+                                }
+                            },
+                            border: { color: '#ef4444', width: 2 },
+                            ticks: {
+                                color: cfg.tickColor,
+                                major: { enabled: true }
+                            }
+                        },
+                        y: {
+                            type: yScaleType,
+                            title: {
+                                display: true,
+                                text: yLabel,
+                                color: cfg.titleColor,
+                                font: { size: 14, weight: '600' }
+                            },
+                            grid: {
+                                color: (context) => {
+                                    if (yScaleType === 'logarithmic' && context.tick && context.tick.major) {
+                                        return 'rgba(239, 68, 68, 0.7)'; // red for major (powers of 10)
+                                    }
+                                    return cfg.gridColor;
+                                },
+                                lineWidth: (context) => {
+                                    if (yScaleType === 'logarithmic' && context.tick && context.tick.major) return 1.5;
+                                    return 1;
+                                }
+                            },
+                            border: { color: '#ef4444', width: 2 },
+                            ticks: {
+                                color: cfg.tickColor,
+                                major: { enabled: true }
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            labels: { color: cfg.legendColor }
+                        },
+                        title: {
+                            display: !!graphTitle,
+                            text: graphTitle,
+                            color: cfg.legendColor,
+                            font: { size: 18, weight: '700' },
+                            padding: { bottom: 16 }
+                        },
+                        tooltip: {
+                            backgroundColor: cfg.tooltipBg,
+                            titleColor: cfg.tooltipTitle,
+                            bodyColor: cfg.tooltipBody,
+                            borderColor: cfg.tooltipBorder,
+                            borderWidth: 1,
+                            callbacks: {
+                                label: function (context) {
+                                    const x = context.parsed.x;
+                                    const y = context.parsed.y;
+                                    const xD = x < 0.01 || x >= 1e6 ? x.toExponential(3) : parseFloat(x.toPrecision(4));
+                                    const yD = y < 0.01 || y >= 1e6 ? y.toExponential(3) : parseFloat(y.toPrecision(4));
+                                    return `X: ${xD}  Y: ${yD}`;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function saveAsImage() {
+            if (!chartInstance) {
+                alert('Please plot data first!');
+                return;
+            }
+
+            const bg = document.getElementById('plotBg').value;
+            const canvas = document.getElementById('logChart');
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = canvas.width;
+            tempCanvas.height = canvas.height;
+            const tempCtx = tempCanvas.getContext('2d');
+
+            // Fill background
+            if (bg === 'white') {
+                tempCtx.fillStyle = '#ffffff';
+            } else if (bg === 'black') {
+                tempCtx.fillStyle = '#000000';
+            } else {
+                tempCtx.fillStyle = '#0f172a';
+            }
+            tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+            tempCtx.drawImage(canvas, 0, 0);
+
+            const link = document.createElement('a');
+            const title = document.getElementById('graphTitle').value || 'plotted-graph';
+            link.download = title.replace(/\s+/g, '_') + '.png';
+            link.href = tempCanvas.toDataURL('image/png');
+            link.click();
+        }
+
+        // Clear crosshair when mouse leaves chart
+        document.getElementById('logChart').addEventListener('mouseleave', () => {
+            if (chartInstance) {
+                chartInstance._crosshair = null;
+                chartInstance.draw();
+                document.getElementById('hoverInfo').innerHTML = `
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10"/>
+                        <line x1="12" y1="16" x2="12" y2="12"/>
+                        <line x1="12" y1="8" x2="12.01" y2="8"/>
+                    </svg>
+                    Hover over the graph to see point values`;
+            }
+        });
+
+        // Initial plot
+        window.onload = updatePlot;
+    </script>
+
+    <footer
+        style="margin-top: 4rem; padding: 2rem; border-top: 1px solid var(--glass-border); width: 100%; text-align: center; color: var(--text-secondary); font-size: 0.9rem;">
+        <p>Created by <strong>Md Abu Hanif Akil</strong> &copy; 2026</p>
+    </footer>
+
+</body>
+
+</html>
