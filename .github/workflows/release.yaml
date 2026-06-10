@@ -17,10 +17,16 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            archive: clocky-windows-installer.exe
+            archive: ikra-windows-installer.exe
 
           - os: ubuntu-latest
-            archive: clocky-linux-installer.deb
+            archive: ikra-ubuntu.deb
+
+          - os: ubuntu-latest
+            archive: ikra-fedora.rpm
+
+          - os: ubuntu-latest
+            archive: ikra-arch.pkg.tar.zst
 
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +34,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # ── Linux system dependencies ──────────────
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -40,7 +47,9 @@ jobs:
             libxkbcommon-dev \
             libssl-dev \
             libglib2.0-dev \
-            libcanberra-gtk3-module
+            libcanberra-gtk3-module \
+            rpm \
+            libarchive-tools
 
       # ── Download pdfium (Windows) ──────────────
       - name: Download pdfium (Windows)
@@ -49,7 +58,6 @@ jobs:
           curl -L "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-x64.tgz" -o pdfium.tgz
           mkdir pdfium
           tar -xzf pdfium.tgz -C pdfium
-          # copy the dll next to where the binary will be built
           cp pdfium/bin/pdfium.dll .
 
       # ── Download pdfium (Linux) ────────────────
@@ -61,6 +69,18 @@ jobs:
           tar -xzf pdfium.tgz -C pdfium
           cp pdfium/lib/libpdfium.so .
 
+      # ── Set pdfium path for build ──────────────
+      - name: Set pdfium library path (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          echo "PDFIUM_DYNAMIC_LIB_PATH=$(pwd)" >> $GITHUB_ENV
+
+      - name: Set pdfium library path (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          echo "PDFIUM_DYNAMIC_LIB_PATH=$(pwd)" >> $env:GITHUB_ENV
+
+      # ── Build ──────────────────────────────────
       - name: Build release
         run: cargo build --release
 
@@ -69,74 +89,115 @@ jobs:
       # ════════════════════════════════════════════
       - name: Create Inno Setup script
         if: matrix.os == 'windows-latest'
+        shell: bash
         run: |
           cat > installer.iss << 'EOF'
           [Setup]
-          AppName=Clocky
-          AppVersion=1.0
-          DefaultDirName={autopf}\Clocky
-          DefaultGroupName=Clocky
-          OutputBaseFilename=clocky-windows-installer
+          AppName=Ikra PDF Editor
+          AppVersion=0.1.0
+          DefaultDirName={autopf}\Ikra
+          DefaultGroupName=Ikra PDF Editor
+          OutputBaseFilename=ikra-windows-installer
           Compression=lzma
           SolidCompression=yes
-          
+
           [Files]
-          Source: "target\release\clocky.exe"; DestDir: "{app}"
-          Source: "pdfium.dll";                DestDir: "{app}"
-          
+          Source: "target\release\ikra.exe"; DestDir: "{app}"
+          Source: "pdfium.dll";              DestDir: "{app}"
+
           [Icons]
-          Name: "{group}\Clocky";        Filename: "{app}\clocky.exe"
-          Name: "{commondesktop}\Clocky"; Filename: "{app}\clocky.exe"
-          
+          Name: "{group}\Ikra PDF Editor";        Filename: "{app}\ikra.exe"
+          Name: "{commondesktop}\Ikra PDF Editor"; Filename: "{app}\ikra.exe"
+
           [Run]
-          Filename: "{app}\clocky.exe"; Description: "Launch Clocky"; Flags: postinstall nowait
+          Filename: "{app}\ikra.exe"; Description: "Launch Ikra PDF Editor"; Flags: postinstall nowait
           EOF
-        shell: bash
 
       - name: Build Windows installer
         if: matrix.os == 'windows-latest'
         run: |
           choco install innosetup -y
           iscc installer.iss
-          mv Output/clocky-windows-installer.exe clocky-windows-installer.exe
+          mv Output/ikra-windows-installer.exe ikra-windows-installer.exe
 
       # ════════════════════════════════════════════
-      # LINUX — .deb package
+      # UBUNTU — .deb
       # ════════════════════════════════════════════
-      - name: Install cargo-deb
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo install cargo-deb --locked
-
-      - name: Prepare pdfium for deb bundle
-        if: matrix.os == 'ubuntu-latest'
+      - name: Build DEB
+        if: matrix.archive == 'ikra-ubuntu.deb'
         run: |
-          mkdir -p pkg/usr/lib
-          cp libpdfium.so pkg/usr/lib/libpdfium.so
-
-      - name: Add deb metadata to Cargo.toml
-        if: matrix.os == 'ubuntu-latest'
-        run: |
+          cargo install cargo-deb --locked
+          mkdir -p deb-extra/usr/lib
+          cp libpdfium.so deb-extra/usr/lib/libpdfium.so
           cat >> Cargo.toml << 'EOF'
 
           [package.metadata.deb]
           maintainer = "hanif-akil"
-          description = "A polished desktop clock"
           section = "utils"
           priority = "optional"
           assets = [
-            ["target/release/clocky",    "usr/bin/clocky",           "755"],
+            ["target/release/ikra",      "usr/bin/ikra",             "755"],
             ["libpdfium.so",             "usr/lib/libpdfium.so",     "644"],
           ]
           EOF
-
-      - name: Build DEB
-        if: matrix.os == 'ubuntu-latest'
-        run: |
           cargo deb
-          mv target/debian/*.deb clocky-linux-installer.deb
+          mv target/debian/*.deb ikra-ubuntu.deb
 
       # ════════════════════════════════════════════
-      # Upload both installers to the release
+      # FEDORA — .rpm
+      # ════════════════════════════════════════════
+      - name: Build RPM
+        if: matrix.archive == 'ikra-fedora.rpm'
+        run: |
+          cargo install cargo-generate-rpm --locked
+          mkdir -p rpm-payload/usr/bin
+          mkdir -p rpm-payload/usr/lib
+          cp target/release/ikra     rpm-payload/usr/bin/ikra
+          cp libpdfium.so            rpm-payload/usr/lib/libpdfium.so
+          cat >> Cargo.toml << 'EOF'
+
+          [package.metadata.generate-rpm]
+          assets = [
+            { source = "target/release/ikra",  dest = "/usr/bin/ikra",             mode = "755" },
+            { source = "libpdfium.so",          dest = "/usr/lib/libpdfium.so",     mode = "644" },
+          ]
+          EOF
+          cargo generate-rpm
+          mv target/generate-rpm/*.rpm ikra-fedora.rpm
+
+      # ════════════════════════════════════════════
+      # ARCH — .pkg.tar.zst (makepkg)
+      # ════════════════════════════════════════════
+      - name: Build Arch package
+        if: matrix.archive == 'ikra-arch.pkg.tar.zst'
+        run: |
+          mkdir -p archpkg/usr/bin
+          mkdir -p archpkg/usr/lib
+          cp target/release/ikra  archpkg/usr/bin/ikra
+          cp libpdfium.so         archpkg/usr/lib/libpdfium.so
+
+          cat > PKGBUILD << 'EOF'
+          pkgname=ikra-pdf-editor
+          pkgver=0.1.0
+          pkgrel=1
+          pkgdesc="A PDF editor built with Rust"
+          arch=('x86_64')
+          license=('MIT')
+
+          package() {
+            install -Dm755 "$srcdir/../../archpkg/usr/bin/ikra"      "$pkgdir/usr/bin/ikra"
+            install -Dm644 "$srcdir/../../archpkg/usr/lib/libpdfium.so" "$pkgdir/usr/lib/libpdfium.so"
+          }
+          EOF
+
+          # makepkg needs a non-root user
+          useradd -m builder
+          chown -R builder:builder .
+          sudo -u builder makepkg -sf --noconfirm
+          mv *.pkg.tar.zst ikra-arch.pkg.tar.zst
+
+      # ════════════════════════════════════════════
+      # Upload to release
       # ════════════════════════════════════════════
       - name: Upload to release
         uses: softprops/action-gh-release@v2
