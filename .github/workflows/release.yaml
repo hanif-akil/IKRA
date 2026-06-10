@@ -34,7 +34,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # ── Linux system dependencies ──────────────
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -49,7 +48,9 @@ jobs:
             libglib2.0-dev \
             libcanberra-gtk3-module \
             rpm \
-            libarchive-tools
+            libarchive-tools \
+            zstd \
+            fakeroot
 
       # ── Download pdfium (Windows) ──────────────
       - name: Download pdfium (Windows)
@@ -72,13 +73,11 @@ jobs:
       # ── Set pdfium path for build ──────────────
       - name: Set pdfium library path (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          echo "PDFIUM_DYNAMIC_LIB_PATH=$(pwd)" >> $GITHUB_ENV
+        run: echo "PDFIUM_DYNAMIC_LIB_PATH=$(pwd)" >> $GITHUB_ENV
 
       - name: Set pdfium library path (Windows)
         if: matrix.os == 'windows-latest'
-        run: |
-          echo "PDFIUM_DYNAMIC_LIB_PATH=$(pwd)" >> $env:GITHUB_ENV
+        run: echo "PDFIUM_DYNAMIC_LIB_PATH=$(pwd)" >> $env:GITHUB_ENV
 
       # ── Build ──────────────────────────────────
       - name: Build release
@@ -98,16 +97,18 @@ jobs:
           DefaultDirName={autopf}\Ikra
           DefaultGroupName=Ikra PDF Editor
           OutputBaseFilename=ikra-windows-installer
+          SetupIconFile=assets\ikra.ico
           Compression=lzma
           SolidCompression=yes
 
           [Files]
           Source: "target\release\ikra.exe"; DestDir: "{app}"
           Source: "pdfium.dll";              DestDir: "{app}"
+          Source: "assets\ikra.ico";         DestDir: "{app}"
 
           [Icons]
-          Name: "{group}\Ikra PDF Editor";        Filename: "{app}\ikra.exe"
-          Name: "{commondesktop}\Ikra PDF Editor"; Filename: "{app}\ikra.exe"
+          Name: "{group}\Ikra PDF Editor";          Filename: "{app}\ikra.exe"; IconFilename: "{app}\ikra.ico"
+          Name: "{commondesktop}\Ikra PDF Editor";   Filename: "{app}\ikra.exe"; IconFilename: "{app}\ikra.ico"
 
           [Run]
           Filename: "{app}\ikra.exe"; Description: "Launch Ikra PDF Editor"; Flags: postinstall nowait
@@ -127,8 +128,18 @@ jobs:
         if: matrix.archive == 'ikra-ubuntu.deb'
         run: |
           cargo install cargo-deb --locked
-          mkdir -p deb-extra/usr/lib
-          cp libpdfium.so deb-extra/usr/lib/libpdfium.so
+
+          cat > assets/ikra.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Ikra PDF Editor
+          Comment=A PDF editor built with Rust
+          Exec=ikra
+          Icon=ikra
+          Terminal=false
+          Type=Application
+          Categories=Office;Graphics;
+          EOF
+
           cat >> Cargo.toml << 'EOF'
 
           [package.metadata.deb]
@@ -136,8 +147,10 @@ jobs:
           section = "utils"
           priority = "optional"
           assets = [
-            ["target/release/ikra",      "usr/bin/ikra",             "755"],
-            ["libpdfium.so",             "usr/lib/libpdfium.so",     "644"],
+            ["target/release/ikra",       "usr/bin/ikra",                                    "755"],
+            ["libpdfium.so",              "usr/lib/libpdfium.so",                            "644"],
+            ["assets/ikra.png",           "usr/share/pixmaps/ikra.png",                      "644"],
+            ["assets/ikra.desktop",       "usr/share/applications/ikra.desktop",             "644"],
           ]
           EOF
           cargo deb
@@ -150,51 +163,76 @@ jobs:
         if: matrix.archive == 'ikra-fedora.rpm'
         run: |
           cargo install cargo-generate-rpm --locked
-          mkdir -p rpm-payload/usr/bin
-          mkdir -p rpm-payload/usr/lib
-          cp target/release/ikra     rpm-payload/usr/bin/ikra
-          cp libpdfium.so            rpm-payload/usr/lib/libpdfium.so
+
+          cat > assets/ikra.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Ikra PDF Editor
+          Comment=A PDF editor built with Rust
+          Exec=ikra
+          Icon=ikra
+          Terminal=false
+          Type=Application
+          Categories=Office;Graphics;
+          EOF
+
           cat >> Cargo.toml << 'EOF'
 
           [package.metadata.generate-rpm]
           assets = [
-            { source = "target/release/ikra",  dest = "/usr/bin/ikra",             mode = "755" },
-            { source = "libpdfium.so",          dest = "/usr/lib/libpdfium.so",     mode = "644" },
+            { source = "target/release/ikra",  dest = "/usr/bin/ikra",                               mode = "755" },
+            { source = "libpdfium.so",          dest = "/usr/lib/libpdfium.so",                       mode = "644" },
+            { source = "assets/ikra.png",       dest = "/usr/share/pixmaps/ikra.png",                 mode = "644" },
+            { source = "assets/ikra.desktop",   dest = "/usr/share/applications/ikra.desktop",        mode = "644" },
           ]
           EOF
           cargo generate-rpm
           mv target/generate-rpm/*.rpm ikra-fedora.rpm
 
       # ════════════════════════════════════════════
-      # ARCH — .pkg.tar.zst (makepkg)
+      # ARCH — .pkg.tar.zst
       # ════════════════════════════════════════════
       - name: Build Arch package
         if: matrix.archive == 'ikra-arch.pkg.tar.zst'
         run: |
-          mkdir -p archpkg/usr/bin
-          mkdir -p archpkg/usr/lib
-          cp target/release/ikra  archpkg/usr/bin/ikra
-          cp libpdfium.so         archpkg/usr/lib/libpdfium.so
+          mkdir -p pkg/usr/bin
+          mkdir -p pkg/usr/lib
+          mkdir -p pkg/usr/share/pixmaps
+          mkdir -p pkg/usr/share/applications
+          cp target/release/ikra   pkg/usr/bin/ikra
+          cp libpdfium.so          pkg/usr/lib/libpdfium.so
+          cp assets/ikra.png       pkg/usr/share/pixmaps/ikra.png
 
-          cat > PKGBUILD << 'EOF'
-          pkgname=ikra-pdf-editor
-          pkgver=0.1.0
-          pkgrel=1
-          pkgdesc="A PDF editor built with Rust"
-          arch=('x86_64')
-          license=('MIT')
-
-          package() {
-            install -Dm755 "$srcdir/../../archpkg/usr/bin/ikra"      "$pkgdir/usr/bin/ikra"
-            install -Dm644 "$srcdir/../../archpkg/usr/lib/libpdfium.so" "$pkgdir/usr/lib/libpdfium.so"
-          }
+          cat > pkg/usr/share/applications/ikra.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Ikra PDF Editor
+          Comment=A PDF editor built with Rust
+          Exec=ikra
+          Icon=ikra
+          Terminal=false
+          Type=Application
+          Categories=Office;Graphics;
           EOF
 
-          # makepkg needs a non-root user
-          useradd -m builder
-          chown -R builder:builder .
-          sudo -u builder makepkg -sf --noconfirm
-          mv *.pkg.tar.zst ikra-arch.pkg.tar.zst
+          SIZE=$(du -sb pkg/usr | cut -f1)
+
+          cat > pkg/.PKGINFO << EOF
+          pkgname = ikra-pdf-editor
+          pkgver = 0.1.0-1
+          pkgdesc = A PDF editor built with Rust
+          url = https://github.com/hanif-akil/IKRA
+          builddate = $(date +%s)
+          packager = hanif-akil
+          size = $SIZE
+          arch = x86_64
+          EOF
+
+          cat > pkg/.MTREE << 'EOF'
+          #mtree
+          EOF
+
+          cd pkg
+          fakeroot bsdtar --zstd -cf ../ikra-arch.pkg.tar.zst *
+          cd ..
 
       # ════════════════════════════════════════════
       # Upload to release
