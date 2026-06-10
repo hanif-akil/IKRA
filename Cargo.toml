@@ -1,7 +1,10 @@
 [package]
-name = "ikra-pdf-editor"
-version = "0.1.0"
-edition = "2021"
+name        = "ikra-pdf-editor"
+version     = "0.1.0"
+edition     = "2021"
+description = "A PDF editor built with Rust"
+authors     = ["hanif-akil"]
+license     = "MIT"
 
 [[bin]]
 name = "ikra"
