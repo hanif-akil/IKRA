@@ -20,11 +20,10 @@ jobs:
       - name: Install Linux Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+          sudo apt-get install -y pkg-config libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
 
       - name: Dynamically Patch Cargo.toml for Package Tools
         run: |
-          # Injecting mandatory description, license, and target layout rules into your Cargo.toml
           cat << 'EOF' >> Cargo.toml
 
           [package.metadata.deb]
@@ -41,7 +40,6 @@ jobs:
           ]
           EOF
           
-          # Inject mandatory fields under [package] section
           sed -i '/\[package\]/a description = "Professional PDF Editor"\nlicense = "MIT"' Cargo.toml
 
       - name: Build Release Binary
@@ -49,9 +47,15 @@ jobs:
 
       - name: Fetch Pre-compiled Packaging Tools (Fast)
         run: |
-          mkdir -p ~/.cargo/bin
-          curl -L https://github.com/kornelski/cargo-deb/releases/download/v2.10.0/cargo-deb_2.10.0_amd64.tar.xz | tar xJ -C ~/.cargo/bin/
-          curl -L https://github.com/cat-in-136/cargo-generate-rpm/releases/download/v0.15.1/cargo-generate-rpm-v0.15.1-x86_64-unknown-linux-musl.tar.gz | tar xz -C ~/.cargo/bin/
+          mkdir -p temp_bin ~/.cargo/bin
+          
+          # Fetch and safely extract cargo-deb binary avoiding folder path structural shifts
+          curl -L https://github.com/kornelski/cargo-deb/releases/download/v2.10.0/cargo-deb_2.10.0_amd64.tar.xz | tar xJ -C temp_bin
+          find temp_bin -type f -name "cargo-deb" -exec mv {} ~/.cargo/bin/ \;
+          
+          # Fetch and safely extract cargo-generate-rpm binary
+          curl -L https://github.com/cat-in-136/cargo-generate-rpm/releases/download/v0.15.1/cargo-generate-rpm-v0.15.1-x86_64-unknown-linux-musl.tar.gz | tar xz -C temp_bin
+          find temp_bin -type f -name "cargo-generate-rpm" -exec mv {} ~/.cargo/bin/ \;
 
       - name: Build Debian Package (.deb)
         run: ~/.cargo/bin/cargo deb
@@ -61,42 +65,53 @@ jobs:
 
       - name: Build Arch Linux Package (.pkg.tar.zst)
         run: |
-          # Launch native isolated Arch Linux container to construct its tracking index package safely
-          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace archlinux:latest bash -c "
-            pacman -Syu --noconfirm base-devel sudo
-            useradd builduser -m && passwd -d builduser
-            printf 'builduser ALL=(ALL) ALL\n' >> /etc/sudoers
-            
-            RAW_VER='${{ github.ref_name }}'
-            CLEAN_VER=\${RAW_VER#v}
+          # Isolate the compilation execution script to protect environment tokens and directory string mapping
+          cat << 'EOF' > build_arch.sh
+          #!/bin/bash
+          set -e
+          pacman -Syu --noconfirm base-devel sudo
+          useradd builduser -m && passwd -d builduser
+          printf 'builduser ALL=(ALL) ALL\n' >> /etc/sudoers
 
-            sudo -u builduser bash -c \"
-              cat << 'EOF' > PKGBUILD
-pkgname=ikra-pdf-editor
-pkgver=\${CLEAN_VER}
-pkgrel=1
-pkgdesc='Professional PDF Editor'
-arch=('x86_64')
-license=('MIT')
-depends=('libxcb' 'libxkbcommon' 'openssl')
-package() {
-  install -Dm755 target/release/ikra \\\${pkgdir}/usr/bin/ikra
-  install -Dm644 assets/ikra.png \\\${pkgdir}/usr/share/pixmaps/ikra.png
-  mkdir -p \\\${pkgdir}/usr/share/applications
-  cat << DESK > \\\${pkgdir}/usr/share/applications/ikra.desktop
-[Desktop Entry]
-Name=IKRA
-Exec=ikra
-Icon=ikra
-Type=Application
-Categories=Office;
-DESK
-}
-EOF
-              makepkg -s --noconfirm
-            \"
-            cp *.pkg.tar.zst target/
-          "
+          cat << 'PKGEof' > PKGBUILD
+          pkgname=ikra-pdf-editor
+          pkgver=${CLEAN_VERSION}
+          pkgrel=1
+          pkgdesc='Professional PDF Editor'
+          arch=('x86_64')
+          license=('MIT')
+          depends=('libxcb' 'libxkbcommon' 'openssl' 'gtk3')
+          package() {
+            install -Dm755 target/release/ikra "${pkgdir}/usr/bin/ikra"
+            if [ -f "assets/ikra.png" ]; then
+              install -Dm644 assets/ikra.png "${pkgdir}/usr/share/pixmaps/ikra.png"
+            fi
+            mkdir -p "${pkgdir}/usr/share/applications"
+            cat << DESK > "${pkgdir}/usr/share/applications/ikra.desktop"
+          [Desktop Entry]
+          Name=IKRA
+          Exec=ikra
+          Icon=ikra
+          Type=Application
+          Categories=Office;
+          DESK
+          }
+          PKGEof
+
+          chown -R builduser:builduser .
+          sudo -u builduser makepkg -s --noconfirm
+          EOF
+
+          chmod +x build_arch.sh
+          CLEAN_VER="${GITHUB_REF_NAME#v}"
+
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            -e CLEAN_VERSION="$CLEAN_VER" \
+            archlinux:latest bash build_arch.sh
+          
+          cp *.pkg.tar.zst target/ 2>/dev/null || true
 
       - name: Upload Linux Artifacts to Workflow
         uses: actions/upload-artifact@v4
@@ -120,6 +135,13 @@ EOF
 
       - name: Generate Inno Setup Deployment Script
         run: |
+          # Dynamically verify if an icon exists before passing parameters to Inno Setup
+          $hasIcon = Test-Path "assets\ikra.ico"
+          $SetupIconLine = if ($hasIcon) { "SetupIconFile=assets\ikra.ico" } else { "" }
+          $IconLine1 = if ($hasIcon) { "Name: `"{group}\IKRA`"; Filename: `"{app}\ikra.exe`"; IconFilename: `"{app}\ikra.ico`"" } else { "Name: `"{group}\IKRA`"; Filename: `"{app}\ikra.exe`"" }
+          $IconLine2 = if ($hasIcon) { "Name: `"{autodesktop}\IKRA`"; Filename: `"{app}\ikra.exe`"; IconFilename: `"{app}\ikra.ico`"" } else { "Name: `"{autodesktop}\IKRA`"; Filename: `"{app}\ikra.exe`"" }
+          $FileIconLine = if ($hasIcon) { "Source: `"assets\ikra.ico`"; DestDir: `"{app}`"; Flags: ignoreversion" } else { "" }
+
           $IssContent = @"
           [Setup]
           AppName=IKRA
@@ -129,15 +151,15 @@ EOF
           OutputBaseFilename=IKRA_Installer
           Compression=lzma
           SolidCompression=yes
-          SetupIconFile=assets\ikra.ico
+          $SetupIconLine
 
           [Files]
           Source: "target\release\ikra.exe"; DestDir: "{app}"; Flags: ignoreversion
-          Source: "assets\ikra.ico"; DestDir: "{app}"; Flags: ignoreversion
+          $FileIconLine
 
           [Icons]
-          Name: "{group}\IKRA"; Filename: "{app}\ikra.exe"; IconFilename: "{app}\ikra.ico"
-          Name: "{autodesktop}\IKRA"; Filename: "{app}\ikra.exe"; IconFilename: "{app}\ikra.ico"
+          $IconLine1
+          $IconLine2
           "@
           Set-Content -Path installer.iss -Value $IssContent
         shell: powershell
