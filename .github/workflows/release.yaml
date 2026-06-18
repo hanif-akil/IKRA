@@ -1,9 +1,12 @@
-name: Release
+name: Release Packages
 
 on:
   push:
     tags:
       - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
   build-linux-packages:
@@ -14,33 +17,56 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Build Dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+      - name: Install Linux Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - name: Dynamically Patch Cargo.toml for Package Tools
+        run: |
+          # Injecting mandatory description, license, and target layout rules into your Cargo.toml
+          cat << 'EOF' >> Cargo.toml
+
+          [package.metadata.deb]
+          maintainer = "Maintainer <support@example.com>"
+          assets = [
+              ["target/release/ikra", "usr/bin/ikra", "755"],
+              ["assets/ikra.png", "usr/share/pixmaps/ikra.png", "644"]
+          ]
+
+          [package.metadata.generate-rpm]
+          assets = [
+              { source = "target/release/ikra", dest = "/usr/bin/ikra", mode = "755" },
+              { source = "assets/ikra.png", dest = "/usr/share/pixmaps/ikra.png", mode = "644" }
+          ]
+          EOF
+          
+          # Inject mandatory fields under [package] section
+          sed -i '/\[package\]/a description = "Professional PDF Editor"\nlicense = "MIT"' Cargo.toml
 
       - name: Build Release Binary
         run: cargo build --release
 
-      - name: Install Packaging Tools (Fast Pre-compiled Binaries)
+      - name: Fetch Pre-compiled Packaging Tools (Fast)
         run: |
-          # Fetch pre-compiled binary releases instead of compiling from source
+          mkdir -p ~/.cargo/bin
           curl -L https://github.com/kornelski/cargo-deb/releases/download/v2.10.0/cargo-deb_2.10.0_amd64.tar.xz | tar xJ -C ~/.cargo/bin/
           curl -L https://github.com/cat-in-136/cargo-generate-rpm/releases/download/v0.15.1/cargo-generate-rpm-v0.15.1-x86_64-unknown-linux-musl.tar.gz | tar xz -C ~/.cargo/bin/
 
-      - name: Build DEB Package
-        run: cargo deb
+      - name: Build Debian Package (.deb)
+        run: ~/.cargo/bin/cargo deb
 
-      - name: Build RPM Package
-        run: cargo generate-rpm
+      - name: Build Fedora Package (.rpm)
+        run: ~/.cargo/bin/cargo generate-rpm
 
       - name: Build Arch Linux Package (.pkg.tar.zst)
         run: |
-          # Use standard docker onto host ubuntu runner to generate native Arch tracking package
+          # Launch native isolated Arch Linux container to construct its tracking index package safely
           docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace archlinux:latest bash -c "
             pacman -Syu --noconfirm base-devel sudo
             useradd builduser -m && passwd -d builduser
             printf 'builduser ALL=(ALL) ALL\n' >> /etc/sudoers
             
-            # Normalize tag version for Arch Linux requirements
             RAW_VER='${{ github.ref_name }}'
             CLEAN_VER=\${RAW_VER#v}
 
@@ -72,7 +98,7 @@ EOF
             cp *.pkg.tar.zst target/
           "
 
-      - name: Upload Linux Artifacts
+      - name: Upload Linux Artifacts to Workflow
         uses: actions/upload-artifact@v4
         with:
           name: linux-packages
@@ -89,10 +115,10 @@ EOF
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Binary
+      - name: Build Windows Release Binary
         run: cargo build --release
 
-      - name: Create Inno Setup Script
+      - name: Generate Inno Setup Deployment Script
         run: |
           $IssContent = @"
           [Setup]
@@ -116,13 +142,39 @@ EOF
           Set-Content -Path installer.iss -Value $IssContent
         shell: powershell
 
-      - name: Compile Windows Installer
+      - name: Compile Windows Executable Installer
         uses: Minionguyjpro/Inno-Setup-Action@v1.2.2
         with:
           path: installer.iss
 
-      - name: Upload Windows Artifact
+      - name: Upload Windows Artifact to Workflow
         uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           path: Output/IKRA_Installer.exe
+
+  publish-github-release:
+    runs-on: ubuntu-latest
+    needs: [build-linux-packages, build-windows-installer]
+    steps:
+      - name: Fetch Linux Bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: ./dist
+
+      - name: Fetch Windows Installer
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: ./dist
+
+      - name: Generate Official GitHub Release Page
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+            dist/IKRA_Installer.exe
+          body: "Automated compiler pipeline distribution for version ${{ github.ref_name }}."
