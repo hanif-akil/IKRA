@@ -1,87 +1,348 @@
 use egui::*;
-use std::collections::HashMap;
+use std::sync::mpsc::{channel, Sender, Receiver};
+use std::thread;
+use std::process::Command;
+use uuid::Uuid;
 
+use crate::annotations::{AnnotationSidecar, pdf_fingerprint};
 use crate::annotations::*;
-use crate::pdf_engine::PdfEngine;
+use crate::pdf_engine::{PdfEngine, WorkerRequest, WorkerResponse};
+use crate::tab::{PdfTab, NoteViewer};
 use crate::ui::{draw_toolbar, handle_shortcuts, Tool, ToolState, ToastMessage};
+use crate::layered_view::{ActiveShape, CurrentStroke, LayeredPageView};
+use crate::text_index::TextIndex;
+use crate::bookmarks::{BookmarkManager, Bookmark, LinkData, FolderData, PdfOutlineEntry, PdfNativeBookmark};
 
-// Lazy-loading: keep at most this many full-res textures around the current page.
-const PAGE_CACHE_RADIUS: usize = 2;
-// Thumb cache: keep a smaller radius of thumbs for memory efficiency.
-const THUMB_CACHE_RADIUS: usize = 5;
-// Gap between the two pages in two-page view (pixels at scale=1).
-const TWO_PAGE_GAP: f32 = 16.0;
-
-fn read_pressure(input: &egui::InputState) -> f32 {
-    for event in &input.events {
-        if let Event::Touch { force: Some(f), .. } = event {
-            return f.clamp(0.01, 1.0);
-        }
-    }
-    0.5
+enum BookmarkAction {
+    /// Load the file at `url`. If `page` is Some, jump there after the file loads.
+    Load(String, Option<usize>),
+    Delete(String),
+    GoToPage(usize),
+    None,
 }
 
-fn ellipse_points(center: Pos2, rx: f32, ry: f32, segments: usize) -> Vec<Pos2> {
-    (0..segments).map(|i| {
-        let a = i as f32 * std::f32::consts::TAU / segments as f32;
-        Pos2::new(center.x + rx * a.cos(), center.y + ry * a.sin())
-    }).collect()
+// ── Top-bar icon+label action button ─────────────────────────────────────────
+
+/// Renders a vertically-stacked icon + label button for the top toolbar.
+/// Returns true if the button was clicked.
+fn toolbar_action_button(
+    ui: &mut Ui,
+    icon: egui::ImageSource<'static>,
+    label: &str,
+    icon_tint: Color32,
+    lbl_color: Color32,
+) -> bool {
+    let btn_size = Vec2::new(56.0, 48.0);
+    let (rect, resp) = ui.allocate_exact_size(btn_size, Sense::click());
+
+    let dark = ui.visuals().dark_mode;
+    let bg = if resp.hovered() {
+        if dark { Color32::from_rgb(35, 45, 65) } else { Color32::from_rgb(220, 228, 240) }
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(6.0), bg);
+
+    // Icon centred in upper portion
+    let icon_rect = egui::Rect::from_center_size(
+        rect.center() - Vec2::new(0.0, 8.0),
+        Vec2::splat(20.0),
+    );
+    ui.put(icon_rect, egui::Image::new(icon).tint(icon_tint));
+
+    // Label below icon
+    ui.painter().text(
+        rect.center() + Vec2::new(0.0, 14.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(10.0),
+        lbl_color,
+    );
+
+    resp.clicked()
 }
 
-struct PageCache { texture: TextureHandle, rendered_scale: f32 }
-struct ActiveStroke { page: usize, points: Vec<StrokePoint> }
-struct ActiveShape  { page: usize, start: Pos2, end: Pos2 }
+// ── Modals ────────────────────────────────────────────────────────────────────
 
-pub struct NoteModal  { pub open: bool, pub text: String, pub page: usize, pub pos: Pos2 }
-pub struct TextModal  { pub open: bool, pub text: String, pub page: usize, pub pos: Pos2, pub font_size: f32 }
-struct NoteViewer     { page: usize, annot_index: usize }
+pub struct NoteModal  { pub open: bool, pub text: String, pub tab_id: Option<Uuid>, pub page: usize, pub pos: Pos2 }
+pub struct TextModal  { pub open: bool, pub text: String, pub tab_id: Option<Uuid>, pub page: usize, pub pos: Pos2, pub font_size: f32 }
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum ConversionState {
+    None,
+    Converting(String),
+}
+
+// ── App struct ────────────────────────────────────────────────────────────────
 
 pub struct IkraApp {
-    engine:            Option<PdfEngine>,
-    page_textures:     HashMap<usize, PageCache>,
-    thumb_textures:    HashMap<usize, TextureHandle>,
-    scale:             f32,
-    current_page:      usize,
-    annots:            AnnotationState,
-    active_stroke:     Option<ActiveStroke>,
-    active_shape:      Option<ActiveShape>,
-    tool_state:        ToolState,
-    toast:             Option<ToastMessage>,
-    note_modal:        NoteModal,
-    text_modal:        TextModal,
-    note_viewer:       Option<NoteViewer>,
-    search_query:      String,
-    search_results:    Vec<usize>,          // pages that contain the query
-    search_match_count: usize,              // total match count across all pages
-    search_current_idx: usize,             // which result we've navigated to
-    /// Approximate index of the first thumb visible in the panel (for lazy thumb loading).
-    thumb_viewport_top: usize,
-    /// Whether two-page side-by-side view is active.
-    two_page_view:     bool,
+    tabs: Vec<PdfTab>,
+    active_tab_id: Option<Uuid>,
+    tool_state: ToolState,
+    toast: Option<ToastMessage>,
+    note_modal: NoteModal,
+    text_modal: TextModal,
+
+    conversion_state: ConversionState,
+    conversion_rx: Option<Receiver<Result<String, String>>>,
+    last_known_conversion_path: String,
+
+    /// Independent text search index (never serialised).
+    /// Populated by `WorkerResponse::TextExtracted` on every document open.
+    text_index: TextIndex,
+
+    worker_tx: Sender<WorkerRequest>,
+    worker_rx: Receiver<WorkerResponse>,
+
+    bookmarks: BookmarkManager,
+    bookmarks_path: std::path::PathBuf,
+    pub show_bookmarks: bool,
+    settings_path: std::path::PathBuf,
+    pub pending_file: Option<String>,
+
+    /// When a bookmark with a page number triggers a Load, we remember
+    /// `(canonical_path, 0-based page)` here so we can jump to it once
+    /// `WorkerResponse::Loaded` arrives for that file.
+    pending_page_jump: Option<(String, usize)>,
+
+
 }
 
+// ── Per-page canvas (now delegates to LayeredPageView) ────────────────────────
+
+fn draw_tab_canvas(
+    tab: &mut PdfTab,
+    tool_state: &mut ToolState,
+    note_modal: &mut NoteModal,
+    text_modal: &mut TextModal,
+    ui: &mut Ui,
+    page_idx: usize,
+    interact_id: Id,
+    ctx: &Context,
+) -> Option<Rect> {
+    // ── Update last_accessed stamp & gather immutable data ────────────────────
+    if let Some(c) = tab.page_textures.get_mut(&page_idx) {
+        c.last_accessed = ctx.input(|i| i.time);
+    }
+    let cache = tab.page_textures.get(&page_idx);
+    let (tex_handle, load_time) = if let Some(c) = cache {
+        (Some(&c.texture), c.load_time)
+    } else {
+        (None, 0.0)
+    };
+
+    let page_size_pts = tab.page_sizes.get(page_idx).copied().unwrap_or((595.0, 842.0));
+
+    let annotations = tab.doc.pages.get(page_idx)
+        .map(|p| p.annotations.clone())
+        .unwrap_or_default();
+
+    let text_map = tab.doc.pages.get(page_idx)
+        .map(|p| p.text_map.clone())
+        .unwrap_or_default();
+
+    let search_rects: Vec<egui::Rect> = if !tab.search_query.trim().is_empty()
+        && page_idx < tab.search_rects.len()
+    {
+        tab.search_rects[page_idx].clone()
+    } else {
+        Vec::new()
+    };
+
+    let scale  = tab.scale;
+    let tab_id = tab.id;
+
+    // ── Temporarily take mutable live-draw buffers out of tab ─────────────────
+    let mut current_stroke_tmp = tab.current_stroke.take();
+    let mut active_shape_tmp   = tab.active_shape.take();
+
+    // Copy NoteViewer so we don't hold a &tab borrow into the widget block
+    let note_viewer_copy: Option<NoteViewer> = tab.note_viewer.as_ref()
+        .map(|nv| NoteViewer { page: nv.page, annot_index: nv.annot_index });
+
+    // Copy the active shape data for the widget display (owned, so no borrow conflict).
+    let active_shape_copy: Option<ActiveShape> = active_shape_tmp
+        .as_ref()
+        .and_then(|s| if s.page == page_idx {
+            Some(ActiveShape { page: s.page, start: s.start, end: s.end })
+        } else { None });
+
+    let nv_ref = note_viewer_copy.as_ref();
+
+    let widget = LayeredPageView::new(
+        page_idx, scale,
+        tex_handle, load_time,
+        &annotations, &text_map, &search_rects,
+        active_shape_copy.as_ref(), nv_ref,
+        interact_id,
+    );
+
+    let mut click_pos: Option<Pos2> = None;
+    let rect = widget.show(
+        ui, ctx, tool_state, page_size_pts,
+        &mut current_stroke_tmp,
+        &mut active_shape_tmp,
+        &mut |pdf_pos| { click_pos = Some(pdf_pos); },
+    );
+
+
+    // ── Restore live-draw buffers ─────────────────────────────────────────────
+    tab.current_stroke = current_stroke_tmp;
+    tab.active_shape   = active_shape_tmp;
+
+    // ── Handle click → open modals ────────────────────────────────────────────
+    if let Some(pdf_pos) = click_pos {
+        match tool_state.tool {
+            Tool::Note => {
+                *note_modal = NoteModal {
+                    open: true, text: String::new(),
+                    tab_id: Some(tab_id),
+                    page: page_idx, pos: pdf_pos,
+                };
+            }
+            Tool::TextBox => {
+                *text_modal = TextModal {
+                    open: true, text: String::new(),
+                    tab_id: Some(tab_id),
+                    page: page_idx, pos: pdf_pos,
+                    font_size: tool_state.brush_size * 5.0 + 8.0,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    // ── Drag-stopped: commit strokes/shapes to annotation layer ──────────────
+    let response = ui.interact(rect, interact_id, Sense::click_and_drag());
+
+    if response.drag_stopped() {
+        if tab.current_stroke.is_some() || tab.active_shape.is_some() {
+            if !tab.needs_undo_checkpoint {
+                tab.doc.push_undo_checkpoint();
+                tab.needs_undo_checkpoint = true;
+            }
+        }
+        if let Some(stroke) = tab.current_stroke.take() {
+            if stroke.page == page_idx {
+                let kind = if tool_state.tool == Tool::Highlight {
+                    AnnotKind::Highlight
+                } else {
+                    AnnotKind::Pen
+                };
+                let color = color32_to_arr(tool_state.color);
+                tab.doc.add_annot(page_idx, AnnotationShape::Pen(PenStroke {
+                    kind, points: stroke.points, color,
+                    width: tool_state.brush_size,
+                }));
+            }
+        }
+        if let Some(shape) = tab.active_shape.take() {
+            if shape.page == page_idx {
+                let kind = match tool_state.tool {
+                    Tool::Rect    => ShapeKind::Rect,
+                    Tool::Ellipse => ShapeKind::Ellipse,
+                    Tool::Arrow   => ShapeKind::Arrow,
+                    _             => ShapeKind::Line,
+                };
+                let color = color32_to_arr(tool_state.color);
+                tab.doc.add_annot(page_idx, AnnotationShape::Shape(ShapeAnnot {
+                    kind,
+                    start: [shape.start.x, shape.start.y],
+                    end:   [shape.end.x,   shape.end.y],
+                    color, width: tool_state.brush_size,
+                    fill: None, dashed: false,
+                }));
+            }
+        }
+    }
+
+    // ── Eraser ────────────────────────────────────────────────────────────────
+    if tool_state.tool == Tool::Eraser {
+        if let Some(pos) = response.hover_pos() {
+            if response.dragged() || response.drag_started() {
+                if response.drag_started() && !tab.needs_undo_checkpoint {
+                    tab.doc.push_undo_checkpoint();
+                    tab.needs_undo_checkpoint = true;
+                }
+                let pdf_pos = Pos2::new(
+                    (pos.x - rect.min.x) / scale,
+                    (pos.y - rect.min.y) / scale,
+                );
+                tab.doc.erase_at(page_idx, pdf_pos, 20.0);
+            }
+        }
+    }
+
+    // ── Note viewer hover ─────────────────────────────────────────────────────
+    if tool_state.tool == Tool::Cursor {
+        if let Some(hover) = response.hover_pos() {
+            let mut found = None;
+            if let Some(page_layer) = tab.doc.pages.get(page_idx) {
+                for (idx, annot) in page_layer.annotations.shapes.iter().enumerate() {
+                    if let AnnotationShape::Note(n) = annot {
+                        let ns = Pos2::new(
+                            rect.min.x + n.pos[0] * scale,
+                            rect.min.y + n.pos[1] * scale,
+                        );
+                        if (hover - ns).length() < 16.0 {
+                            found = Some((page_idx, idx));
+                            break;
+                        }
+                    }
+                }
+            }
+            tab.note_viewer = found.map(|(page, annot_index)| NoteViewer { page, annot_index });
+        }
+    }
+
+    Some(rect)
+}
+
+
+
+// ── App impl ──────────────────────────────────────────────────────────────────
+
 impl IkraApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<String>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        
+        let mut visuals = egui::Visuals::dark();
+        visuals.window_shadow = egui::epaint::Shadow::NONE;
+        visuals.popup_shadow = egui::epaint::Shadow::NONE;
+        cc.egui_ctx.set_visuals(visuals);
+
+        let (wt_tx, wr_rx) = channel();
+        let (wr_tx, wt_rx) = channel();
+
+        PdfEngine::start_worker(wr_rx, wr_tx);
+
+        let mut bpath = std::env::current_dir().unwrap_or_default();
+        bpath.push("bookmarks.json");
+
+        let mut settings_path = std::env::current_dir().unwrap_or_default();
+        settings_path.push("settings.json");
+        let tool_state = ToolState::load_from_disk(&settings_path).unwrap_or_default();
+
         Self {
-            engine: PdfEngine::new().ok(),
-            page_textures: HashMap::new(),
-            thumb_textures: HashMap::new(),
-            scale: 1.4,
-            current_page: 0,
-            annots: AnnotationState::new(0),
-            active_stroke: None,
-            active_shape: None,
-            tool_state: ToolState::default(),
+            tabs: Vec::new(),
+            active_tab_id: None,
+            tool_state,
             toast: None,
-            note_modal: NoteModal { open: false, text: String::new(), page: 0, pos: Pos2::ZERO },
-            text_modal: TextModal { open: false, text: String::new(), page: 0, pos: Pos2::ZERO, font_size: 16.0 },
-            note_viewer: None,
-            search_query: String::new(),
-            search_results: Vec::new(),
-            search_match_count: 0,
-            search_current_idx: 0,
-            thumb_viewport_top: 0,
-            two_page_view: false,
+            note_modal: NoteModal { open: false, text: String::new(), tab_id: None, page: 0, pos: Pos2::ZERO },
+            text_modal: TextModal { open: false, text: String::new(), tab_id: None, page: 0, pos: Pos2::ZERO, font_size: 16.0 },
+            conversion_state: ConversionState::None,
+            conversion_rx: None,
+            last_known_conversion_path: String::new(),
+            text_index: TextIndex::new(),
+            worker_tx: wt_tx,
+            worker_rx: wt_rx,
+            bookmarks: BookmarkManager::load_from_disk(&bpath).unwrap_or_else(|_| BookmarkManager::new()),
+            bookmarks_path: bpath,
+            show_bookmarks: false,
+            settings_path,
+            pending_file: initial_file,
+            pending_page_jump: None,
+
         }
     }
 
@@ -89,968 +350,1323 @@ impl IkraApp {
         self.toast = Some(ToastMessage::new(text, ctx));
     }
 
-    fn page_count(&self) -> usize {
-        self.engine.as_ref().map(|e| e.page_count).unwrap_or(0)
+    fn active_tab(&mut self) -> Option<&mut PdfTab> {
+        let id = self.active_tab_id?;
+        self.tabs.iter_mut().find(|t| t.id == id)
     }
 
-    fn pdf_name(&self) -> String {
-        self.engine.as_ref()
-            .and_then(|e| e.current_path.as_deref())
-            .and_then(|p| std::path::Path::new(p).file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("No file open")
-            .to_string()
+    fn active_tab_ref(&self) -> Option<&PdfTab> {
+        let id = self.active_tab_id?;
+        self.tabs.iter().find(|t| t.id == id)
     }
 
     fn load_file(&mut self, path: &str, ctx: &Context) {
-        if let Some(engine) = &mut self.engine {
-            match engine.open(path) {
-                Err(e) => self.show_toast(format!("Failed to open: {}", e), ctx),
-                Ok(_) => {
-                    self.page_textures.clear();
-                    self.thumb_textures.clear();
-                    self.annots = AnnotationState::new(engine.page_count);
-                    self.current_page = 0;
-                    self.thumb_viewport_top = 0;
-                    self.search_results.clear();
-                    self.search_match_count = 0;
-                    self.search_current_idx = 0;
-                    self.show_toast("PDF loaded!", ctx);
-                }
-            }
+        if crate::pdf_engine::is_pdf_file(path) {
+            let id = Uuid::new_v4();
+            self.show_toast(format!("Loading {}", path), ctx);
+            let _ = self.worker_tx.send(WorkerRequest::Load(id, path.to_string()));
+        } else {
+            self.start_conversion(path.to_string(), ctx);
         }
     }
 
-    /// Change zoom scale, clear stale textures for full-res pages only.
-    fn set_scale(&mut self, new_scale: f32) {
-        let clamped = new_scale.clamp(0.1, 8.0);
-        if (clamped - self.scale).abs() > 0.005 {
-            self.scale = clamped;
-            self.page_textures.clear(); // must re-render at new scale
+    fn start_conversion(&mut self, path: String, ctx: &Context) {
+        let (tx, rx) = channel();
+        self.conversion_rx = Some(rx);
+        self.conversion_state = ConversionState::Converting(path.clone());
+        self.last_known_conversion_path = path.clone();
+        let ctx = ctx.clone();
+
+        thread::spawn(move || {
+            let temp_dir = std::env::temp_dir();
+            let output = Command::new("soffice")
+                .args(["--headless", "--convert-to", "pdf", "--outdir", temp_dir.to_str().unwrap(), &path])
+                .output();
+
+            let result = match output {
+                Ok(out) if out.status.success() => {
+                    let file_name = std::path::Path::new(&path)
+                        .file_stem().unwrap_or_default().to_string_lossy();
+                    let pdf_path = temp_dir.join(format!("{}.pdf", file_name));
+                    Ok(pdf_path.to_string_lossy().into_owned())
+                }
+                Ok(out) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+                Err(e)  => Err(format!("Failed to run soffice. Make sure LibreOffice is installed. Error: {}", e)),
+            };
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    // ── Save annotations to versioned JSON sidecar ────────────────────────────
+
+    fn save_annotations_json(&self, tab: &PdfTab) {
+        let sidecar = std::path::Path::new(&tab.file_path).with_extension("ikra.json");
+        if let Ok(json) = tab.annotations_to_sidecar_json() {
+            let _ = std::fs::write(&sidecar, json);
         }
     }
 
-    fn screen_to_pdf(&self, screen: Pos2, origin: Pos2) -> Pos2 {
-        Pos2::new((screen.x - origin.x) / self.scale, (screen.y - origin.y) / self.scale)
-    }
-
-    fn pdf_to_screen(&self, pdf: Pos2, origin: Pos2) -> Pos2 {
-        Pos2::new(origin.x + pdf.x * self.scale, origin.y + pdf.y * self.scale)
-    }
-
-    /// Returns the second page index shown in two-page view, or None.
-    fn right_page(&self) -> Option<usize> {
-        if !self.two_page_view { return None; }
-        let next = self.current_page + 1;
-        if next < self.page_count() { Some(next) } else { None }
-    }
-
-    /// Ensure the current page (and neighbours including two-page right) are rendered.
-    fn manage_page_cache(&mut self, ctx: &Context) {
-        let page  = self.current_page;
-        let total = self.page_count();
-        // In two-page view we need at least page+1 too
-        let hi_extra = if self.two_page_view { PAGE_CACHE_RADIUS + 1 } else { PAGE_CACHE_RADIUS };
-        let lo = page.saturating_sub(PAGE_CACHE_RADIUS);
-        let hi = (page + hi_extra).min(total.saturating_sub(1));
-
-        self.page_textures.retain(|k, _| *k >= lo && *k <= hi);
-
-        if let Some(engine) = &self.engine {
-            for p in lo..=hi {
-                if self.page_textures.contains_key(&p) { continue; }
-                if let Some(img) = engine.render_page(p, self.scale) {
-                    let size = [img.width() as _, img.height() as _];
-                    let rgba = img.into_rgba8();
-                    let ci = ColorImage::from_rgba_unmultiplied(size, rgba.as_flat_samples().as_slice());
-                    drop(rgba);
-                    let tex = ctx.load_texture(format!("page_{p}"), ci, TextureOptions::LINEAR);
-                    self.page_textures.insert(p, PageCache { texture: tex, rendered_scale: self.scale });
-                }
-            }
-        }
-    }
-
-    /// Ensure thumbnails near `center` are rendered; evict distant ones.
-    fn manage_thumb_cache(&mut self, ctx: &Context, center: usize) {
-        let total = self.page_count();
-        if total == 0 { return; }
-
-        let lo = center.saturating_sub(THUMB_CACHE_RADIUS);
-        let hi = (center + THUMB_CACHE_RADIUS).min(total.saturating_sub(1));
-
-        self.thumb_textures.retain(|k, _| *k >= lo && *k <= hi);
-
-        if let Some(engine) = &self.engine {
-            for p in lo..=hi {
-                if self.thumb_textures.contains_key(&p) { continue; }
-                if let Some(img) = engine.render_thumb(p) {
-                    let size = [img.width() as _, img.height() as _];
-                    let rgba = img.into_rgba8();
-                    let ci = ColorImage::from_rgba_unmultiplied(size, rgba.as_flat_samples().as_slice());
-                    drop(rgba);
-                    let tex = ctx.load_texture(format!("thumb_{p}"), ci, TextureOptions::LINEAR);
-                    self.thumb_textures.insert(p, tex);
-                }
-            }
-        }
-    }
-
-    fn draw_annotations(&self, painter: &Painter, page: usize, origin: Pos2) {
-        if page >= self.annots.pages.len() { return; }
-        for (idx, annot) in self.annots.pages[page].items.iter().enumerate() {
-            match annot {
-                Annot::Pen(s) => {
-                    if s.points.len() < 2 { continue; }
-                    let pts: Vec<Pos2> = s.points.iter()
-                        .map(|p| self.pdf_to_screen(p.to_pos2(), origin)).collect();
-                    match s.kind {
-                        AnnotKind::Highlight => {
-                            let c = arr_to_color32(s.color);
-                            let hc = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(),
-                                (self.tool_state.opacity * 255.0) as u8);
-                            painter.add(Shape::Path(egui::epaint::PathShape {
-                                points: pts, closed: false, fill: Color32::TRANSPARENT,
-                                stroke: egui::epaint::PathStroke::new(s.width * self.scale * 8.0, hc),
-                            }));
-                        }
-                        AnnotKind::Pen => {
-                            let color = arr_to_color32(s.color);
-                            for i in 1..pts.len() {
-                                painter.line_segment([pts[i-1], pts[i]],
-                                    Stroke::new(s.width * self.scale, color));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Annot::Shape(s) => {
-                    let p1 = self.pdf_to_screen(Pos2::new(s.start[0], s.start[1]), origin);
-                    let p2 = self.pdf_to_screen(Pos2::new(s.end[0],   s.end[1]),   origin);
-                    let color  = arr_to_color32(s.color);
-                    let stroke = Stroke::new(s.width * self.scale, color);
-                    match s.kind {
-                        ShapeKind::Rect => {
-                            painter.rect_stroke(Rect::from_two_pos(p1, p2), 0.0, stroke);
-                        }
-                        ShapeKind::Ellipse => {
-                            let c  = Pos2::new((p1.x+p2.x)/2.0, (p1.y+p2.y)/2.0);
-                            let rx = (p2.x-p1.x).abs()/2.0;
-                            let ry = (p2.y-p1.y).abs()/2.0;
-                            painter.add(Shape::Path(egui::epaint::PathShape {
-                                points: ellipse_points(c, rx, ry, 48),
-                                closed: true, fill: Color32::TRANSPARENT,
-                                stroke: egui::epaint::PathStroke::new(s.width*self.scale, color),
-                            }));
-                        }
-                        ShapeKind::Arrow => {
-                            painter.line_segment([p1, p2], stroke);
-                            let dir  = (p2-p1).normalized();
-                            let perp = Vec2::new(-dir.y, dir.x);
-                            let hl = 12.0*self.scale; let hw = 6.0*self.scale;
-                            painter.line_segment([p2, p2 - dir*hl + perp*hw], stroke);
-                            painter.line_segment([p2, p2 - dir*hl - perp*hw], stroke);
-                        }
-                        ShapeKind::Line => { painter.line_segment([p1, p2], stroke); }
-                    }
-                }
-                Annot::TextBox(t) => {
-                    let pos   = self.pdf_to_screen(Pos2::new(t.pos[0], t.pos[1]), origin);
-                    let color = arr_to_color32(t.color);
-                    painter.text(pos, Align2::LEFT_TOP, &t.text,
-                        FontId::proportional(t.font_size * self.scale), color);
-                }
-                Annot::Note(n) => {
-                    let pos = self.pdf_to_screen(Pos2::new(n.pos[0], n.pos[1]), origin);
-                    painter.circle_filled(pos, 10.0 * self.scale.sqrt(),
-                        Color32::from_rgb(255, 220, 50));
-                    painter.text(pos, Align2::CENTER_CENTER, "📝",
-                        FontId::proportional(14.0), Color32::BLACK);
-                    if let Some(v) = &self.note_viewer {
-                        if v.page == page && v.annot_index == idx {
-                            let pp = pos + Vec2::new(15.0, -10.0);
-                            let tr = Rect::from_min_size(pp, Vec2::new(200.0, 80.0));
-                            painter.rect_filled(tr, 4.0, Color32::from_rgb(255, 250, 200));
-                            painter.rect_stroke(tr, 4.0,
-                                Stroke::new(1.0, Color32::from_rgb(180, 160, 0)));
-                            painter.text(pp + Vec2::new(6.0, 6.0), Align2::LEFT_TOP,
-                                &n.text, FontId::proportional(12.0), Color32::BLACK);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Draw a translucent yellow banner at the top of a page rect if it's a search result page.
-    fn draw_search_highlight(&self, painter: &Painter, page_idx: usize, page_rect: Rect) {
-        if self.search_query.trim().is_empty() { return; }
-        if !self.search_results.contains(&page_idx) { return; }
-
-        // Full-page translucent yellow tint
-        painter.rect_filled(
-            page_rect,
-            0.0,
-            Color32::from_rgba_unmultiplied(255, 230, 0, 28),
-        );
-
-        // Top banner label
-        let banner = Rect::from_min_size(page_rect.min, Vec2::new(page_rect.width(), 22.0 * self.scale.sqrt()));
-        painter.rect_filled(banner, 0.0, Color32::from_rgba_unmultiplied(255, 210, 0, 180));
-        painter.text(
-            banner.center(),
-            Align2::CENTER_CENTER,
-            "🔍 Match found on this page",
-            FontId::proportional(11.0 * self.scale.sqrt().clamp(0.7, 1.4)),
-            Color32::from_rgb(80, 50, 0),
-        );
-    }
-
-    fn draw_active_shape_preview(&self, painter: &Painter, origin: Pos2) {
-        let Some(shape) = &self.active_shape else { return };
-        let p1     = self.pdf_to_screen(shape.start, origin);
-        let p2     = self.pdf_to_screen(shape.end,   origin);
-        let color  = self.tool_state.color;
-        let stroke = Stroke::new(self.tool_state.brush_size * self.scale, color);
-        match self.tool_state.tool {
-            Tool::Rect    => { painter.rect_stroke(Rect::from_two_pos(p1, p2), 0.0, stroke); }
-            Tool::Ellipse => {
-                let c  = Pos2::new((p1.x+p2.x)/2.0, (p1.y+p2.y)/2.0);
-                let rx = (p2.x-p1.x).abs()/2.0; let ry = (p2.y-p1.y).abs()/2.0;
-                painter.add(Shape::Path(egui::epaint::PathShape {
-                    points: ellipse_points(c, rx, ry, 48), closed: true,
-                    fill: Color32::TRANSPARENT,
-                    stroke: egui::epaint::PathStroke::new(self.tool_state.brush_size*self.scale, color),
-                }));
-            }
-            Tool::Arrow => {
-                painter.line_segment([p1, p2], stroke);
-                let dir  = (p2-p1).normalized();
-                let perp = Vec2::new(-dir.y, dir.x);
-                let hl = 12.0*self.scale; let hw = 6.0*self.scale;
-                painter.line_segment([p2, p2 - dir*hl + perp*hw], stroke);
-                painter.line_segment([p2, p2 - dir*hl - perp*hw], stroke);
-            }
-            Tool::Line => { painter.line_segment([p1, p2], stroke); }
-            _ => {}
-        }
-    }
-
-    /// Draw one PDF page in the scroll area. Returns the rect of the page image drawn.
-    /// `interact_id` must be unique per page so responses don't collide.
-    fn draw_page_canvas(
-        &mut self,
-        ui:           &mut Ui,
-        page_idx:     usize,
-        interact_id:  Id,
-        ctx:          &Context,
-    ) -> Option<Rect> {
-        let cache = self.page_textures.get(&page_idx)?;
-        let origin   = ui.cursor().min;
-        let tex_size = cache.texture.size_vec2();
-        let rect     = Rect::from_min_size(origin, tex_size);
-
-        let (_, painter) = ui.allocate_painter(tex_size, Sense::click_and_drag());
-        let response     = ui.interact(rect, interact_id, Sense::click_and_drag());
-
-        // Page shadow
-        let shadow_rect = rect.translate(Vec2::new(3.0, 3.0));
-        painter.rect_filled(shadow_rect, 2.0, Color32::from_black_alpha(40));
-
-        // PDF page image
-        painter.image(cache.texture.id(), rect,
-            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-
-        // Search highlight overlay (behind annotations)
-        self.draw_search_highlight(&painter, page_idx, rect);
-
-        // Committed annotations
-        self.draw_annotations(&painter, page_idx, origin);
-
-        // Live shape preview (only on the page being actively drawn)
-        if self.active_shape.as_ref().map(|s| s.page) == Some(page_idx) {
-            self.draw_active_shape_preview(&painter, origin);
-        }
-
-        // ── Input ──────────────────────────────────────────────────────────
-        if let Some(pos) = response.hover_pos() {
-            let pdf_pos  = self.screen_to_pdf(pos, origin);
-            let pressure = ctx.input(|i| read_pressure(i));
-
-            let is_shape = matches!(self.tool_state.tool,
-                Tool::Rect | Tool::Ellipse | Tool::Arrow | Tool::Line);
-            let is_free  = matches!(self.tool_state.tool,
-                Tool::Pen | Tool::Highlight);
-
-            if response.drag_started() {
-                match self.tool_state.tool {
-                    Tool::Eraser => {
-                        self.annots.erase_at(page_idx, pdf_pos, 20.0);
-                    }
-                    _ if is_free => {
-                        self.active_stroke = Some(ActiveStroke {
-                            page: page_idx,
-                            points: vec![StrokePoint::new(pdf_pos, pressure)],
-                        });
-                    }
-                    _ if is_shape => {
-                        self.active_shape = Some(ActiveShape {
-                            page: page_idx,
-                            start: pdf_pos, end: pdf_pos,
-                        });
-                    }
-                    _ => {}
-                }
-            } else if response.dragged() {
-                if let Some(s) = &mut self.active_stroke {
-                    if s.page == page_idx {
-                        s.points.push(StrokePoint::new(pdf_pos, pressure));
-                    }
-                }
-                if let Some(s) = &mut self.active_shape {
-                    if s.page == page_idx { s.end = pdf_pos; }
-                }
-                if self.tool_state.tool == Tool::Eraser {
-                    self.annots.erase_at(page_idx, pdf_pos, 20.0);
-                }
-            } else if response.drag_stopped() {
-                // Commit freehand
-                if let Some(stroke) = self.active_stroke.take() {
-                    let kind = if self.tool_state.tool == Tool::Highlight {
-                        AnnotKind::Highlight } else { AnnotKind::Pen };
-                    let color = color32_to_arr(self.tool_state.color);
-                    self.annots.add_annot(page_idx,
-                        Annot::Pen(PenStroke {
-                            kind, points: stroke.points, color,
-                            width: self.tool_state.brush_size,
-                        }));
-                }
-                // Commit shape
-                if let Some(shape) = self.active_shape.take() {
-                    let kind = match self.tool_state.tool {
-                        Tool::Rect    => ShapeKind::Rect,
-                        Tool::Ellipse => ShapeKind::Ellipse,
-                        Tool::Arrow   => ShapeKind::Arrow,
-                        _             => ShapeKind::Line,
+    fn load_annotations_json(&mut self, tab_id: Uuid, ctx: &Context) {
+        // We need the file path but also a mutable tab reference later.
+        // Split into two borrows to satisfy the borrow checker.
+        let file_path = match self.tabs.iter().find(|t| t.id == tab_id) {
+            Some(t) => t.file_path.clone(),
+            None    => return,
+        };
+        let sidecar = std::path::Path::new(&file_path).with_extension("ikra.json");
+        if let Ok(data) = std::fs::read_to_string(&sidecar) {
+            match AnnotationSidecar::from_json(&data) {
+                Ok(loaded) => {
+                    // Check PDF integrity fingerprint
+                    let fp_mismatch = match (&loaded.pdf_fingerprint, pdf_fingerprint(&file_path)) {
+                        (Some(saved), Some(current)) => saved != &current,
+                        _ => false,
                     };
-                    let color = color32_to_arr(self.tool_state.color);
-                    self.annots.add_annot(page_idx,
-                        Annot::Shape(ShapeAnnot {
-                            kind,
-                            start: [shape.start.x, shape.start.y],
-                            end:   [shape.end.x,   shape.end.y],
-                            color, width: self.tool_state.brush_size,
-                            fill: None, dashed: false,
-                        }));
-                }
-            }
-
-            // Click-only tools
-            if response.clicked() {
-                match self.tool_state.tool {
-                    Tool::Note => {
-                        self.note_modal = NoteModal {
-                            open: true, text: String::new(),
-                            page: page_idx, pos: pdf_pos,
-                        };
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tab.annotations_from_sidecar(&loaded);
                     }
-                    Tool::TextBox => {
-                        self.text_modal = TextModal {
-                            open: true, text: String::new(),
-                            page: page_idx, pos: pdf_pos,
-                            font_size: self.tool_state.brush_size * 5.0 + 8.0,
-                        };
-                    }
-                    _ => {}
-                }
-            }
-
-            // Note hover (cursor tool)
-            if self.tool_state.tool == Tool::Cursor {
-                let mut found = None;
-                if page_idx < self.annots.pages.len() {
-                    for (idx, annot) in self.annots.pages[page_idx].items.iter().enumerate() {
-                        if let Annot::Note(n) = annot {
-                            let ns = self.pdf_to_screen(Pos2::new(n.pos[0], n.pos[1]), origin);
-                            if (pos - ns).length() < 16.0 {
-                                found = Some((page_idx, idx));
-                                break;
-                            }
-                        }
+                    if fp_mismatch {
+                        self.show_toast(
+                            "⚠ PDF changed since last save — annotations may be misaligned",
+                            ctx,
+                        );
                     }
                 }
-                self.note_viewer = found.map(|(page, annot_index)| NoteViewer { page, annot_index });
+                Err(e) => {
+                    self.show_toast(format!("⚠ Could not load annotations: {}", e), ctx);
+                }
             }
         }
+    }
 
-        Some(rect)
+    fn draw_bookmark_tree(ui: &mut Ui, nodes: &[Bookmark]) -> BookmarkAction {
+        let mut action = BookmarkAction::None;
+        for node in nodes {
+            match node {
+                Bookmark::Folder(folder) => {
+                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        Id::new(&folder.id),
+                        false,
+                    )
+                    .show_header(ui, |ui| {
+                        ui.label(format!("📁 {}", folder.title));
+                        if ui.button("🗑").on_hover_text("Delete Folder").clicked() {
+                            action = BookmarkAction::Delete(folder.id.clone());
+                        }
+                    })
+                    .body(|ui| {
+                        let a = Self::draw_bookmark_tree(ui, &folder.children);
+                        if !matches!(a, BookmarkAction::None) {
+                            action = a;
+                        }
+                    });
+                }
+                Bookmark::Link(link) => {
+                    ui.horizontal(|ui| {
+                        // Main button: load the file (and carry along the saved page).
+                        let btn_label = format!("📄 {}", link.title);
+                        if ui.button(&btn_label)
+                            .on_hover_text(&link.url)
+                            .clicked()
+                        {
+                            action = BookmarkAction::Load(link.url.clone(), link.page);
+                        }
+
+                        // If this bookmark has a saved page, show a small badge
+                        // button that navigates directly to that page in the
+                        // currently-active tab (useful when the file is already open).
+                        if let Some(pg) = link.page {
+                            let badge_label = format!("p.{}", pg + 1);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(&badge_label)
+                                            .size(10.0)
+                                            .color(Color32::from_rgb(49, 130, 206)),
+                                    )
+                                    .small()
+                                    .frame(true),
+                                )
+                                .on_hover_text(format!("Jump to page {} in the active tab", pg + 1))
+                                .clicked()
+                            {
+                                action = BookmarkAction::GoToPage(pg);
+                            }
+                        }
+
+                        if ui.button("🗑").on_hover_text("Delete Bookmark").clicked() {
+                            action = BookmarkAction::Delete(link.id.clone());
+                        }
+                    });
+                }
+            }
+        }
+        action
+    }
+
+    /// Collect all user bookmarks that target `file_path` and have a saved page,
+    /// converting them into native PDF outline entries for burn-in on save.
+    /// Folder hierarchy is preserved: a Bookmark::Folder becomes a parent node
+    /// whose target_page is the first page-bearing descendant (so it has a valid
+    /// jump target), and its children are mapped recursively.
+    fn native_bookmarks_for_file(bms: &[Bookmark], file_path: &str) -> Vec<PdfNativeBookmark> {
+        let mut out = Vec::new();
+        for bm in bms {
+            match bm {
+                Bookmark::Link(l) if l.url == file_path => {
+                    if let Some(pg) = l.page {
+                        out.push(PdfNativeBookmark {
+                            title:       l.title.clone(),
+                            target_page: pg,
+                            children:    Vec::new(),
+                        });
+                    }
+                }
+                Bookmark::Folder(f) => {
+                    // Build children recursively first so we can derive a target page.
+                    let children = Self::native_bookmarks_for_file(&f.children, file_path);
+                    if children.is_empty() {
+                        // No page-bearing descendants for this file — skip the folder.
+                        continue;
+                    }
+                    // Use the first child's target_page as this folder node's jump target
+                    // (required: every lopdf::Bookmark must have a page ObjectId).
+                    let target_page = children[0].target_page;
+                    out.push(PdfNativeBookmark {
+                        title: f.title.clone(),
+                        target_page,
+                        children,
+                    });
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Each entry with children becomes a collapsible section; clicking
+    /// an entry navigates to its destination page.
+    fn draw_pdf_outline(
+        ui: &mut Ui,
+        entries: &[PdfOutlineEntry],
+        goto_page: &mut Option<usize>,
+        depth: usize,
+    ) {
+        for (i, entry) in entries.iter().enumerate() {
+            let has_children = !entry.children.is_empty();
+            let page_label = entry.page.map(|p| format!("p.{}", p + 1)).unwrap_or_default();
+
+            if has_children {
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    Id::new(format!("pdf_outline_{}_{}_{}", depth, i, &entry.title)),
+                    depth == 0,  // top-level sections open by default
+                )
+                .show_header(ui, |ui| {
+                    let btn_text = if page_label.is_empty() {
+                        format!("📂 {}", entry.title)
+                    } else {
+                        format!("📂 {} ({})", entry.title, page_label)
+                    };
+                    if ui.button(RichText::new(btn_text).size(13.0)).clicked() {
+                        if let Some(p) = entry.page {
+                            *goto_page = Some(p);
+                        }
+                    }
+                })
+                .body(|ui| {
+                    Self::draw_pdf_outline(ui, &entry.children, goto_page, depth + 1);
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    let btn_text = if page_label.is_empty() {
+                        format!("  📄 {}", entry.title)
+                    } else {
+                        format!("  📄 {} ({})", entry.title, page_label)
+                    };
+                    if ui.button(RichText::new(btn_text).size(12.5)).clicked() {
+                        if let Some(p) = entry.page {
+                            *goto_page = Some(p);
+                        }
+                    }
+                });
+            }
+        }
     }
 }
 
+// ── eframe App ────────────────────────────────────────────────────────────────
+
 impl eframe::App for IkraApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-
-        // ── Handle Ctrl+Scroll zoom (read before panels consume scroll) ────────
-        let (scroll_delta, ctrl) = ctx.input(|i| (i.raw_scroll_delta, i.modifiers.ctrl));
-        if ctrl && scroll_delta.y.abs() > 0.5 {
-            let new_scale = if scroll_delta.y > 0.0 {
-                self.scale * 1.1
-            } else {
-                self.scale / 1.1
-            };
-            self.set_scale(new_scale);
+        if let Some(path) = self.pending_file.take() {
+            self.load_file(&path, ctx);
         }
 
-        // ── Keyboard shortcuts ────────────────────────────────────────────────────
-        if let Some(action) = handle_shortcuts(&mut self.tool_state, ctx) {
-            if action == "save" {
-                let path = self.engine.as_ref()
-                    .and_then(|e| e.current_path.clone());
-                if let Some(p) = path {
-                    let annots = self.annots.pages.clone();
-                    if let Some(engine) = &mut self.engine {
-                        match engine.save_with_annotations(&p, &annots) {
-                            Ok(_)  => self.show_toast("Saved!", ctx),
-                            Err(e) => self.show_toast(format!("Save error: {e}"), ctx),
+        // ── Cross-Platform Drag and Drop Handler ─────────────────────────────
+        let dropped_file = ctx.input(|i| {
+            i.raw.dropped_files.first()
+                .and_then(|f| f.path.as_ref())
+                .and_then(|p| p.to_str())
+                .map(|s| {
+                    // 1. Strip file:// protocol strings safely across systems
+                    let mut path_str = s.to_string();
+                    if path_str.starts_with("file://") {
+                        path_str = path_str.replacen("file://", "", 1);
+                        
+                        // On Windows, file:///C:/path becomes /C:/path. 
+                        // Strip the leading slash if a drive letter follows it.
+                        if path_str.starts_with('/') && path_str.chars().nth(2) == Some(':') {
+                            path_str.remove(0);
                         }
                     }
-                } else if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("PDF", &["pdf"]).save_file()
-                {
-                    let annots = self.annots.pages.clone();
-                    if let Some(engine) = &mut self.engine {
-                        match engine.save_with_annotations(&path.to_string_lossy(), &annots) {
-                            Ok(_)  => self.show_toast("Saved!", ctx),
-                            Err(e) => self.show_toast(format!("Save error: {e}"), ctx),
+
+                    // 2. In-place Percent/URL Decoding (handles spaces %20, symbols, and accents)
+                    let mut decoded = String::new();
+                    let mut chars = path_str.chars();
+                    while let Some(ch) = chars.next() {
+                        if ch == '%' {
+                            if let (Some(c1), Some(c2)) = (chars.next(), chars.next()) {
+                                if let Ok(byte) = u8::from_str_radix(&format!("{}{}", c1, c2), 16) {
+                                    decoded.push(byte as char);
+                                    continue;
+                                }
+                                decoded.push('%');
+                                decoded.push(c1);
+                                decoded.push(c2);
+                            } else {
+                                decoded.push('%');
+                            }
+                        } else {
+                            decoded.push(ch);
                         }
+                    }
+                    decoded
+                })
+        });
+
+        if let Some(path) = dropped_file {
+            self.load_file(&path, ctx);
+            ctx.request_repaint(); // Force immediate UI switch to the new tab
+        }
+
+        // Apply themes globally
+        match self.tool_state.theme {
+            crate::ui::Theme::Dark => {
+                let mut visuals = Visuals::dark();
+                visuals.window_fill = Color32::from_rgb(35, 38, 41);  // KDE Breeze Dark base
+                visuals.panel_fill  = Color32::from_rgb(42, 46, 50);  // KDE Breeze Dark panel
+                
+                // Breeze Blue accent
+                let breeze_blue = Color32::from_rgb(61, 174, 233);
+                visuals.selection.bg_fill = breeze_blue;
+                visuals.hyperlink_color = breeze_blue;
+                
+                // Breeze-like widget styling: 3px rounding, crisp borders
+                let rounding = Rounding::same(8.0);
+                visuals.widgets.noninteractive.rounding = rounding;
+                visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(49, 54, 59));
+                
+                visuals.widgets.inactive.rounding = rounding;
+                visuals.widgets.inactive.bg_fill = Color32::from_rgb(49, 54, 59);
+                visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(61, 67, 73));
+                
+                visuals.widgets.hovered.rounding = rounding;
+                visuals.widgets.hovered.bg_fill = Color32::from_rgb(61, 67, 73);
+                visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, breeze_blue);
+                
+                visuals.widgets.active.rounding = rounding;
+                visuals.widgets.active.bg_fill = Color32::from_rgb(42, 46, 50);
+                visuals.widgets.active.bg_stroke = Stroke::new(1.0, breeze_blue);
+                
+                ctx.set_visuals(visuals);
+            }
+            crate::ui::Theme::Light => {
+                let mut visuals = Visuals::light();
+                visuals.window_fill = Color32::from_rgb(239, 240, 241); // KDE Breeze Light base
+                visuals.panel_fill  = Color32::from_rgb(252, 252, 252); // KDE Breeze Light panel
+                
+                let breeze_blue = Color32::from_rgb(61, 174, 233);
+                visuals.selection.bg_fill = breeze_blue;
+                visuals.hyperlink_color = breeze_blue;
+                
+                let rounding = Rounding::same(8.0);
+                visuals.widgets.noninteractive.rounding = rounding;
+                visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(200, 204, 207));
+                
+                visuals.widgets.inactive.rounding = rounding;
+                visuals.widgets.inactive.bg_fill = Color32::from_rgb(220, 224, 227);
+                visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(189, 195, 199));
+                
+                visuals.widgets.hovered.rounding = rounding;
+                visuals.widgets.hovered.bg_fill = Color32::from_rgb(235, 238, 240);
+                visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, breeze_blue);
+                
+                visuals.widgets.active.rounding = rounding;
+                visuals.widgets.active.bg_fill = Color32::from_rgb(252, 252, 252);
+                visuals.widgets.active.bg_stroke = Stroke::new(1.0, breeze_blue);
+                
+                ctx.set_visuals(visuals);
+            }
+            crate::ui::Theme::Glassmorphism => {
+                let mut visuals = Visuals::dark();
+                // Overriding backgrounds to be mostly transparent so actual design elements can pop
+                visuals.window_fill = Color32::from_rgba_premultiplied(30, 30, 30, 200);
+                visuals.panel_fill  = Color32::from_rgb(18, 18, 18);
+                // White glints
+                visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_white_alpha(30));
+                ctx.set_visuals(visuals);
+            }
+            crate::ui::Theme::Skeuomorphism => {
+                let mut visuals = Visuals::dark();
+                visuals.window_fill = Color32::from_rgb(40, 40, 45);
+                visuals.panel_fill  = Color32::from_rgb(30, 32, 40);
+                visuals.widgets.noninteractive.rounding = Rounding::same(8.0);
+                visuals.widgets.inactive.rounding = Rounding::same(8.0);
+                ctx.set_visuals(visuals);
+            }
+        }
+
+        let mut style = (*ctx.style()).clone();
+        style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+        style.visuals.popup_shadow = egui::epaint::Shadow::NONE;
+        style.visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
+        style.visuals.widgets.hovered.rounding  = egui::Rounding::same(8.0);
+        style.visuals.widgets.active.rounding   = egui::Rounding::same(8.0);
+        style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
+        ctx.set_style(style);
+        // Flush GPU garbage from last frame — explicitly free textures
+        for tab in &mut self.tabs {
+            for tex in tab.garbage_textures.drain(..) {
+                drop(tex);  // Force immediate drop
+            }
+        }
+
+        // ── Worker responses ──────────────────────────────────────────────────
+        while let Ok(res) = self.worker_rx.try_recv() {
+            match res {
+                WorkerResponse::Loaded(id, path, _count, sizes, Ok(())) => {
+                    // Check before moving `path` into the tab whether we have a
+                    // pending page-jump for this exact file.
+                    let jump_page = self.pending_page_jump
+                        .as_ref()
+                        .filter(|(p, _)| p == &path)
+                        .map(|(_, pg)| *pg);
+                    if jump_page.is_some() {
+                        self.pending_page_jump = None;
+                    }
+
+                    let mut tab = PdfTab::new(id, path, sizes);
+                    // Apply the saved page jump immediately if the tab already
+                    // knows its page count; otherwise it defaults to page 0 which
+                    // is fine — the outline scroll will show the right page once
+                    // the first render fires.
+                    if let Some(pg) = jump_page {
+                        if pg < tab.page_count() {
+                            tab.current_page = pg;
+                        }
+                    }
+                    let tab_id = tab.id;
+                    self.tabs.push(tab);
+                    self.active_tab_id = Some(tab_id);
+                    // Load any existing annotation sidecar (with fingerprint check)
+                    self.load_annotations_json(tab_id, ctx);
+                    self.show_toast("PDF loaded — extracting text index…", ctx);
+                }
+                WorkerResponse::Loaded(_id, _path, _count, _sizes, Err(e)) => {
+                    self.toast = Some(ToastMessage::new(format!("Failed to load: {}", e), ctx));
+                }
+                // ── Text extraction complete ──────────────────────────────────
+                WorkerResponse::TextExtracted(id, text_maps) => {
+                    // 1. Store in the independent TextIndex for direct search access.
+                    self.text_index.insert(id, text_maps.clone());
+                    // 2. Populate PageLayer.text_map so existing find_text() calls work.
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                        for (i, tm) in text_maps.into_iter().enumerate() {
+                            if i < tab.doc.pages.len() {
+                                tab.doc.pages[i].text_map = tm;
+                            }
+                        }
+                    }
+                }
+                // ── Outline (PDF bookmarks) extracted ─────────────────────────
+                WorkerResponse::OutlineExtracted(id, outline) => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                        tab.pdf_outline = outline;
+                    }
+                }
+                WorkerResponse::Rendered(id, page, scale, kind, img) => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                        tab.process_render_response(id, page, scale, kind, img, ctx);
+                    }
+                }
+                WorkerResponse::Saved(_id, Ok(())) => {
+                    self.show_toast("Saved!", ctx);
+                }
+                WorkerResponse::Saved(_id, Err(e)) => {
+                    self.show_toast(format!("Save error: {}", e), ctx);
+                }
+                WorkerResponse::PageAdded(id, Ok((new_count, w, h))) => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                        tab.page_sizes.push((w, h));
+                        tab.doc.pages.push(crate::annotations::PageLayer::default());
+                        tab.current_page = new_count - 1;
+                        for (_, cache) in tab.page_textures.drain() {
+                            tab.garbage_textures.push(cache.texture);
+                        }
+                        tab.pending_renders.clear();
+                    }
+                    self.show_toast("Blank page added!", ctx);
+                }
+                WorkerResponse::PageAdded(_id, Err(e)) => {
+                    self.show_toast(format!("Add page failed: {}", e), ctx);
+                }
+            }
+        }
+
+        // ── Conversion polling ────────────────────────────────────────────────
+        if let Some(rx) = &self.conversion_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.conversion_state = ConversionState::None;
+                self.conversion_rx = None;
+                match res {
+                    Ok(pdf_path) => {
+                        self.load_file(&pdf_path, ctx);
+                        self.show_toast("Conversion successful!", ctx);
+                    }
+                    Err(e) => {
+                        self.show_toast(format!("Conversion failed: {}", e), ctx);
                     }
                 }
             }
         }
 
-        // ── TOP BAR ──────────────────────────────────────────────────────────────
+        // ── Drag and Drop ─────────────────────────────────────────────────────
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        for file in dropped {
+            if let Some(path) = file.path {
+                self.load_file(&path.to_string_lossy(), ctx);
+            }
+        }
+
+        // ── Ctrl+Scroll zoom ──────────────────────────────────────────────────
+        let (scroll_delta, ctrl) = ctx.input(|i| (i.raw_scroll_delta, i.modifiers.ctrl));
+        if ctrl && scroll_delta.y.abs() > 0.5 {
+            let dy = scroll_delta.y;
+            let tx = self.worker_tx.clone();
+            if let Some(tab) = self.active_tab() {
+                let new_scale = if dy > 0.0 { tab.scale * 1.1 } else { tab.scale / 1.1 };
+                tab.set_scale(new_scale, Some(&tx));
+            }
+        }
+
+        // ── Handle drag & drop files ──────────────────────────────────────────────
+        ctx.input(|i| {
+            for file in &i.raw.dropped_files {
+                if let Some(path) = &file.path {
+                    let path_str = path.to_string_lossy().to_string();
+                    self.load_file(&path_str, ctx);
+                }
+            }
+        });
+
+        // ── Keyboard shortcuts ────────────────────────────────────────────────
+        if let Some(action) = handle_shortcuts(&mut self.tool_state, ctx) {
+            if action == "save" {
+                if let Some(tab) = self.active_tab_ref() {
+                    let tab_id = tab.id;
+                    let path   = tab.file_path.clone();
+                    let annots = tab.annotation_layers_cloned();
+                    self.save_annotations_json(tab);
+                    let native_bms = Self::native_bookmarks_for_file(&self.bookmarks.root, &path);
+                    let _ = self.worker_tx.send(WorkerRequest::Save(tab_id, path, annots, native_bms));
+                    self.show_toast("Saving…", ctx);
+                }
+            } else if action == "next_tab" {
+                if !self.tabs.is_empty() {
+                    let idx = self.tabs.iter().position(|t| Some(t.id) == self.active_tab_id).unwrap_or(0);
+                    let next_idx = (idx + 1) % self.tabs.len();
+                    self.active_tab_id = Some(self.tabs[next_idx].id);
+                }
+            } else if action == "close_tab" {
+                if let Some(id) = self.active_tab_id {
+                    let _ = self.worker_tx.send(WorkerRequest::Close(id));
+                    
+                    // Explicitly drain and drop all textures BEFORE removing tab
+                    if let Some(tab_pos) = self.tabs.iter().position(|t| t.id == id) {
+                        let mut tab = self.tabs.remove(tab_pos);
+                        // Force immediate GPU memory release
+                        for tex in tab.page_textures.values_mut() {
+                            // Move texture to garbage queue and let egui free it
+                            tab.garbage_textures.push(tex.texture.clone());
+                        }
+                        tab.page_textures.clear();
+                        for tex in tab.thumb_textures.values_mut() {
+                            tab.garbage_textures.push(tex.clone());
+                        }
+                        tab.thumb_textures.clear();
+                        // Drain garbage immediately
+                        for tex in tab.garbage_textures.drain(..) {
+                            drop(tex);
+                        }
+                    }
+                    
+                    if self.active_tab_id == Some(id) {
+                        self.active_tab_id = self.tabs.last().map(|t| t.id);
+                    }
+                }
+            } else if action == "undo" {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| Some(t.id) == self.active_tab_id) {
+                    if tab.doc.undo() { self.show_toast("Undo", ctx); }
+                }
+            } else if action == "redo" {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| Some(t.id) == self.active_tab_id) {
+                    if tab.doc.redo() { self.show_toast("Redo", ctx); }
+                }
+            }
+        }
+
+        // ── Top bar ───────────────────────────────────────────────────────────
         TopBottomPanel::top("top_bar")
-            .min_height(56.0)
+            .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill).stroke(egui::Stroke::NONE))
+            .min_height(80.0)
             .show(ctx, |ui| {
-                ui.add_space(6.0);
+                // Tab bar (no separator at the bottom)
+                if let Some(path) = crate::ui::draw_tab_bar(ui, &mut self.tabs, &mut self.active_tab_id, &self.worker_tx) {
+                    self.load_file(&path, ctx);
+                }
 
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
+                let dark = ui.visuals().dark_mode;
+                // Icon tint: white on dark theme so icons are visible
+                let icon_tint = if dark { Color32::WHITE } else { Color32::from_gray(30) };
+                let lbl_color = if dark { Color32::from_gray(210) } else { Color32::from_gray(50) };
 
-                    // ── File ops ─────────────────────────────────────────────
-                    if ui.add_sized([80.0, 32.0], Button::new("📂 Open")).clicked() {
+                ui.add_space(4.0);
+                egui::ScrollArea::horizontal()
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            ui.add_space(12.0);
+
+                    // ── Open ──────────────────────────────────────────────────
+                    let open_clicked = toolbar_action_button(
+                        ui, egui::include_image!("../assets/folder-open.svg"),
+                        "Open", icon_tint, lbl_color,
+                    );
+                    if open_clicked {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("PDF", &["pdf"]).pick_file()
+                            .add_filter("All Supported", &["pdf", "docx", "doc", "odt", "rtf", "ppt", "pptx", "odp"])
+                            .pick_file()
                         {
                             self.load_file(&path.to_string_lossy(), ctx);
                         }
                     }
-                    if ui.add_sized([80.0, 32.0], Button::new("💾 Save")).clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
+
+                    // ── Save ──────────────────────────────────────────────────
+                    let save_clicked = toolbar_action_button(
+                        ui, egui::include_image!("../assets/floppy-disk.svg"),
+                        "Save", icon_tint, lbl_color,
+                    );
+                    if save_clicked {
+                        if let Some(save_path) = rfd::FileDialog::new()
                             .add_filter("PDF", &["pdf"]).save_file()
                         {
-                            let annots = self.annots.pages.clone();
-                            if let Some(engine) = &mut self.engine {
-                                match engine.save_with_annotations(&path.to_string_lossy(), &annots) {
-                                    Ok(_)  => self.show_toast("Saved with annotations!", ctx),
-                                    Err(e) => self.show_toast(format!("Save error: {e}"), ctx),
+                            if let Some(tab) = self.active_tab_ref() {
+                                let tab_id = tab.id;
+                                let annots = tab.annotation_layers_cloned();
+                                self.save_annotations_json(tab);
+                                let save_path_str = save_path.to_string_lossy().to_string();
+                                let native_bms = Self::native_bookmarks_for_file(
+                                    &self.bookmarks.root, &tab.file_path,
+                                );
+                                let _ = self.worker_tx.send(WorkerRequest::Save(
+                                    tab_id,
+                                    save_path_str,
+                                    annots,
+                                    native_bms,
+                                ));
+                                self.show_toast("Saving…", ctx);
+                            }
+                        }
+                    }
+
+                    // ── New Page ──────────────────────────────────────────────
+                    let new_page_clicked = toolbar_action_button(
+                        ui, egui::include_image!("../assets/file-plus.svg"),
+                        "New Page", icon_tint, lbl_color,
+                    );
+                    if new_page_clicked {
+                        if let Some(tab_id) = self.active_tab_id {
+                            let _ = self.worker_tx.send(WorkerRequest::AddBlankPage(tab_id));
+                            self.show_toast("Adding blank page…", ctx);
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // ── Page navigation ───────────────────────────────────────
+                    if let Some(tab) = self.active_tab() {
+                        let total = tab.page_count();
+                        if total > 0 {
+                            if ui.add_sized([28.0, 36.0], Button::new(
+                                RichText::new("◀").color(lbl_color)
+                            )).on_hover_text("Previous page").clicked() {
+                                if tab.current_page > 0 { tab.current_page -= 1; }
+                            }
+                            let input_id = ui.make_persistent_id("page_input");
+                            let mut page_str = ui.ctx().data(|d| d.get_temp::<String>(input_id)).unwrap_or_else(|| format!("{}", tab.current_page + 1));
+                            
+                            if !ui.ctx().memory(|m| m.has_focus(input_id)) {
+                                page_str = format!("{}", tab.current_page + 1);
+                            }
+                            
+                            let text_edit = TextEdit::singleline(&mut page_str)
+                                .id(input_id)
+                                .vertical_align(egui::Align::Center)
+                                .horizontal_align(egui::Align::Center)
+                                .margin(egui::vec2(6.0, 4.0));
+                            
+                            if ui.add_sized([35.0, 36.0], text_edit).changed() {
+                                ui.ctx().data_mut(|d| d.insert_temp(input_id, page_str.clone()));
+                                if let Ok(parsed) = page_str.parse::<usize>() {
+                                    if parsed > 0 && parsed <= total {
+                                        tab.current_page = parsed - 1;
+                                    }
+                                }
+                            }
+                            
+                            ui.add_sized([30.0, 36.0], Label::new(RichText::new(
+                                format!(" / {}", total)
+                            ).size(14.0).color(lbl_color)));
+                            if ui.add_sized([28.0, 36.0], Button::new(
+                                RichText::new("▶").color(lbl_color)
+                            )).on_hover_text("Next page").clicked() {
+                                if tab.current_page + 1 < total { tab.current_page += 1; }
+                            }
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // ── Search ────────────────────────────────────────────────
+                    ui.label(RichText::new("🔍").color(lbl_color));
+                    let mut do_search       = false;
+                    let mut clear_search    = false;
+                    let mut result_nav_prev = false;
+                    let mut result_nav_next = false;
+
+                    if let Some(tab) = self.active_tab() {
+                        let search_resp = ui.add_sized([130.0, 32.0],
+                            TextEdit::singleline(&mut tab.search_query)
+                                .hint_text("Search…")
+                                .vertical_align(egui::Align::Center)
+                                .margin(egui::vec2(8.0, 4.0))
+                        );
+                        let enter = search_resp.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter));
+                        do_search = ui.add_sized([60.0, 32.0], Button::new("Search")).clicked() || enter;
+
+                        if !tab.search_results.is_empty() {
+                            let badge = format!("{}/{}", tab.search_current_idx + 1, tab.search_results.len());
+                            ui.label(RichText::new(badge).size(11.0).color(Color32::from_rgb(49, 130, 206)).strong());
+                            ui.label(RichText::new(format!("({} matches)", tab.search_match_count)).size(10.0).color(Color32::GRAY));
+                            if ui.add_sized([22.0, 28.0], Button::new("‹")).on_hover_text("Previous").clicked() { result_nav_prev = true; }
+                            if ui.add_sized([22.0, 28.0], Button::new("›")).on_hover_text("Next").clicked()     { result_nav_next = true; }
+                            if ui.add_sized([22.0, 28.0], Button::new("✕")).on_hover_text("Clear").clicked()    { clear_search = true; }
+                        }
+                    }
+
+                    if do_search {
+                        if let Some(tab) = self.active_tab() {
+                            let q = tab.search_query.clone();
+                            let hits = tab.doc.find_text(&q);
+                            tab.search_rects = vec![Vec::new(); tab.page_count()];
+                            tab.search_results.clear();
+                            for (page, rect) in hits {
+                                if page < tab.search_rects.len() {
+                                    if !tab.search_results.contains(&page) {
+                                        tab.search_results.push(page);
+                                    }
+                                    tab.search_rects[page].push(rect);
+                                }
+                            }
+                            tab.search_results.sort_unstable();
+                            tab.search_match_count = tab.search_rects.iter().map(|v| v.len()).sum();
+                            tab.search_current_idx = 0;
+                            if let Some(&first_page) = tab.search_results.first() {
+                                tab.current_page = first_page;
+                            }
+                        }
+                    }
+                    if result_nav_prev {
+                        if let Some(tab) = self.active_tab() {
+                            if tab.search_current_idx == 0 { tab.search_current_idx = tab.search_results.len().saturating_sub(1); }
+                            else { tab.search_current_idx -= 1; }
+                            tab.current_page = tab.search_results[tab.search_current_idx];
+                        }
+                    }
+                    if result_nav_next {
+                        if let Some(tab) = self.active_tab() {
+                            tab.search_current_idx = (tab.search_current_idx + 1) % tab.search_results.len();
+                            tab.current_page = tab.search_results[tab.search_current_idx];
+                        }
+                    }
+                    if clear_search {
+                        if let Some(tab) = self.active_tab() {
+                            tab.search_query.clear();
+                            tab.search_results.clear();
+                            tab.search_rects.clear();
+                            tab.search_match_count = 0;
+                            tab.search_current_idx = 0;
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    let tx = self.worker_tx.clone();
+                    // ── Zoom ──────────────────────────────────────────────────
+                    if ui.add_sized([28.0, 32.0], Button::new(RichText::new("−").color(lbl_color))).on_hover_text("Zoom out").clicked() {
+                        if let Some(tab) = self.active_tab() { let s = tab.scale; tab.set_scale(s / 1.2, Some(&tx)); }
+                    }
+                    let scale_val = self.active_tab_ref().map(|t| t.scale).unwrap_or(1.0);
+                    if ui.add_sized([52.0, 32.0], Button::new(RichText::new(format!("{:.0}%", scale_val * 100.0)).size(13.0).color(lbl_color)))
+                        .on_hover_text("Click to reset zoom").clicked()
+                    {
+                        if let Some(tab) = self.active_tab() { tab.set_scale(1.0, Some(&tx)); }
+                    }
+                    if ui.add_sized([28.0, 32.0], Button::new(RichText::new("+").color(lbl_color))).on_hover_text("Zoom in").clicked() {
+                        if let Some(tab) = self.active_tab() { let s = tab.scale; tab.set_scale(s * 1.2, Some(&tx)); }
+                    }
+                    if ui.add_sized([46.0, 32.0], Button::new(RichText::new("⊡ Fit").color(lbl_color))).on_hover_text("Fit page").clicked() {
+                        let avail = ctx.screen_rect().width() - 70.0 - 145.0 - 40.0;
+                        let tx = self.worker_tx.clone();
+                        if let Some(tab) = self.active_tab() {
+                            let curr = tab.current_page;
+                            if curr < tab.page_sizes.len() {
+                                let (pw, _) = tab.page_sizes[curr];
+                                let divisor = if tab.two_page_view { 2.1 } else { 1.0 };
+                                if pw > 0.0 { tab.set_scale(avail / pw / divisor, Some(&tx)); }
+                            }
+                        }
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(8.0);
+
+                        // Settings gear
+                        let settings_clicked = toolbar_action_button(
+                            ui, egui::include_image!("../assets/gear-six.svg"),
+                            "Settings", icon_tint, lbl_color,
+                        );
+                        if settings_clicked {
+                            self.tool_state.settings_open = !self.tool_state.settings_open;
+                        }
+
+                        ui.add_space(8.0);
+
+                        // Bookmarks toggle
+                        let b_btn = if self.show_bookmarks {
+                            Button::new(RichText::new("🔖 Bookmarks").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(49, 130, 206))
+                        } else {
+                            Button::new(RichText::new("🔖 Bookmarks").color(lbl_color))
+                        };
+                        if ui.add_sized([110.0, 36.0], b_btn).on_hover_text("Toggle Bookmarks").clicked() {
+                            self.show_bookmarks = !self.show_bookmarks;
+                        }
+
+                        ui.add_space(8.0);
+
+                        // 2-Page toggle
+                        let two_page_active = self.active_tab_ref().map(|t| t.two_page_view).unwrap_or(false);
+                        let btn = if two_page_active {
+                            Button::new(RichText::new("📖 2-Page").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(49, 130, 206))
+                        } else {
+                            Button::new(RichText::new("📖 2-Page").color(lbl_color))
+                        };
+                        if ui.add_sized([100.0, 36.0], btn).on_hover_text("Toggle 2-Page").clicked() {
+                            if let Some(tab) = self.active_tab() {
+                                tab.two_page_view = !tab.two_page_view;
+                                if tab.two_page_view && tab.current_page % 2 == 1 {
+                                    tab.current_page = tab.current_page.saturating_sub(1);
+                                }
+                                for (_, cache) in tab.page_textures.drain() {
+                                    tab.garbage_textures.push(cache.texture);
+                                }
+                                tab.pending_renders.clear();
+                            }
+                        }
+                        
+                        ui.add_space(12.0);
+
+
+                    });
+                });
+                });
+                ui.add_space(4.0);
+            });
+
+        // ── Arrow-key / Ctrl+2 shortcuts (when no text field focused) ─────────
+        if !ctx.memory(|m| m.focused().is_some()) {
+            ctx.input(|i| {
+                if i.modifiers.ctrl && i.key_pressed(Key::Num2) {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| Some(t.id) == self.active_tab_id) {
+                        tab.two_page_view = !tab.two_page_view;
+                        if tab.two_page_view && tab.current_page % 2 == 1 {
+                            tab.current_page = tab.current_page.saturating_sub(1);
+                        }
+                        for (_, cache) in tab.page_textures.drain() {
+                            tab.garbage_textures.push(cache.texture);
+                        }
+                        tab.pending_renders.clear();
+                    }
+                }
+                if i.key_pressed(Key::ArrowLeft) {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| Some(t.id) == self.active_tab_id) {
+                        if tab.current_page > 0 { tab.current_page -= 1; }
+                    }
+                }
+                if i.key_pressed(Key::ArrowRight) {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| Some(t.id) == self.active_tab_id) {
+                        if tab.current_page + 1 < tab.page_count() { tab.current_page += 1; }
+                    }
+                }
+            });
+        }
+
+        // ── Bookmarks Panel ───────────────────────────────────────────────────
+        if self.show_bookmarks {
+            SidePanel::left("bookmarks_panel")
+                .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill).stroke(egui::Stroke::NONE))
+                .resizable(true)
+                .min_width(180.0)
+                .max_width(350.0)
+                .show(ctx, |ui| {
+                    // ── PDF internal outline (TOC) ────────────────────────────
+                    ui.label(RichText::new("📑 Document Outline").strong().size(16.0));
+                    ui.separator();
+
+                    let outline = self.active_tab_ref()
+                        .map(|t| t.pdf_outline.clone())
+                        .unwrap_or_default();
+
+                    if outline.is_empty() {
+                        ui.allocate_ui(egui::vec2(ui.available_width(), ui.available_height() * 0.55), |ui| {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(RichText::new("No document outline found").color(Color32::from_gray(120)));
+                            });
+                        });
+                    } else {
+                        let mut goto_page: Option<usize> = None;
+                        ScrollArea::vertical()
+                            .id_salt("pdf_outline_scroll")
+                            .max_height(ui.available_height() * 0.55)
+                            .show(ui, |ui| {
+                                Self::draw_pdf_outline(ui, &outline, &mut goto_page, 0);
+                            });
+
+                        if let Some(page) = goto_page {
+                            if let Some(tab) = self.active_tab() {
+                                if page < tab.page_count() {
+                                    tab.current_page = page;
                                 }
                             }
                         }
                     }
-                    if ui.add_sized([110.0, 32.0], Button::new("📄 Blank Page")).clicked() {
-                        let cur = self.current_page;
-                        if let Some(engine) = &mut self.engine {
-                            if engine.add_blank_page(cur, 595.0, 842.0).is_ok() {
-                                let shifted: HashMap<usize, PageCache> = self.page_textures
-                                    .drain()
-                                    .map(|(k, v)| (if k > cur { k + 1 } else { k }, v))
-                                    .collect();
-                                self.page_textures = shifted;
-                                let shifted_t: HashMap<usize, TextureHandle> = self.thumb_textures
-                                    .drain()
-                                    .map(|(k, v)| (if k > cur { k + 1 } else { k }, v))
-                                    .collect();
-                                self.thumb_textures = shifted_t;
-                                self.annots.insert_page(cur + 1);
-                                self.current_page = cur + 1;
-                                self.show_toast("Blank page inserted after current page", ctx);
-                            }
-                        }
-                    }
 
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── User bookmarks ────────────────────────────────────────
+                    ui.label(RichText::new("🔖 Bookmarks").strong().size(16.0));
                     ui.separator();
 
-                    // ── Page nav ─────────────────────────────────────────────
-                    let total = self.page_count();
-                    if total > 0 {
-                        if ui.add_sized([28.0, 28.0], Button::new("◀")).clicked()
-                            && self.current_page > 0
-                        { self.current_page -= 1; }
-
-                        ui.add_sized([70.0, 28.0],
-                            Label::new(RichText::new(
-                                format!("{} / {}", self.current_page + 1, total)
-                            ).size(14.0))
-                        );
-
-                        if ui.add_sized([28.0, 28.0], Button::new("▶")).clicked()
-                            && self.current_page + 1 < total
-                        { self.current_page += 1; }
-                    }
-
-                    ui.separator();
-
-                    // ── Search ───────────────────────────────────────────────
-                    ui.label("🔍");
-                    let search_resp = ui.add(
-                        TextEdit::singleline(&mut self.search_query)
-                            .desired_width(130.0)
-                            .hint_text("Search…")
-                    );
-                    // Search on Enter key too
-                    let enter_pressed = search_resp.lost_focus()
-                        && ctx.input(|i| i.key_pressed(Key::Enter));
-
-                    let do_search = ui.add_sized([60.0, 28.0], Button::new("Search")).clicked()
-                        || enter_pressed;
-
-                    if do_search {
-                        if let Some(engine) = &self.engine {
-                            let (pages, total_matches) =
-                                engine.search_text_with_count(&self.search_query);
-                            self.search_results    = pages;
-                            self.search_match_count = total_matches;
-                            self.search_current_idx = 0;
-                            if let Some(&first) = self.search_results.first() {
-                                self.current_page = first;
-                                self.show_toast(
-                                    format!("Found {} match(es) on {} page(s)",
-                                        self.search_match_count,
-                                        self.search_results.len()),
-                                    ctx);
-                            } else {
-                                self.show_toast("No results found", ctx);
-                            }
-                        }
-                    }
-
-                    // Prev / Next result navigation
-                    if !self.search_results.is_empty() {
-                        // Result counter badge
-                        let badge_txt = format!(
-                            "{}/{}",
-                            self.search_current_idx + 1,
-                            self.search_results.len()
-                        );
-                        ui.label(
-                            RichText::new(badge_txt)
-                                .size(11.0)
-                                .color(Color32::from_rgb(49, 130, 206))
-                                .strong(),
-                        );
-
-                        // Total match count
-                        ui.label(
-                            RichText::new(format!("({} matches)", self.search_match_count))
-                                .size(10.0)
-                                .color(Color32::GRAY),
-                        );
-
-                        if ui.add_sized([22.0, 24.0], Button::new("‹"))
-                            .on_hover_text("Previous result page").clicked()
-                        {
-                            if self.search_current_idx == 0 {
-                                self.search_current_idx = self.search_results.len() - 1;
-                            } else {
-                                self.search_current_idx -= 1;
-                            }
-                            self.current_page = self.search_results[self.search_current_idx];
-                        }
-                        if ui.add_sized([22.0, 24.0], Button::new("›"))
-                            .on_hover_text("Next result page").clicked()
-                        {
-                            self.search_current_idx =
-                                (self.search_current_idx + 1) % self.search_results.len();
-                            self.current_page = self.search_results[self.search_current_idx];
-                        }
-
-                        // Clear search
-                        if ui.add_sized([22.0, 24.0], Button::new("✕"))
-                            .on_hover_text("Clear search").clicked()
-                        {
-                            self.search_query.clear();
-                            self.search_results.clear();
-                            self.search_match_count = 0;
-                            self.search_current_idx = 0;
-                        }
-                    }
-
-                    ui.separator();
-
-                    // ── Zoom controls ─────────────────────────────────────────
-                    if ui.add_sized([28.0, 28.0], Button::new("−"))
-                        .on_hover_text("Zoom out  (Ctrl −scroll)").clicked()
-                    { self.set_scale(self.scale / 1.2); }
-
-                    if ui.add_sized([52.0, 28.0],
-                        Button::new(RichText::new(format!("{:.0}%", self.scale * 100.0)).size(13.0)))
-                        .on_hover_text("Click to reset zoom to 100%").clicked()
-                    { self.set_scale(1.0); }
-
-                    if ui.add_sized([28.0, 28.0], Button::new("+"))
-                        .on_hover_text("Zoom in  (Ctrl +scroll)").clicked()
-                    { self.set_scale(self.scale * 1.2); }
-
-                    if ui.add_sized([46.0, 28.0], Button::new("⊡ Fit"))
-                        .on_hover_text("Fit page width to window").clicked()
-                    {
-                        let avail = ctx.screen_rect().width() - 70.0 - 145.0 - 40.0;
-                        if let Some(engine) = &self.engine {
-                            if let Some((pw, _)) = engine.page_size(self.current_page) {
-                                // In two-page view, each page gets roughly half the width
-                                let divisor = if self.two_page_view { 2.1 } else { 1.0 };
-                                if pw > 0.0 { self.set_scale(avail / pw / divisor); }
-                            }
-                        }
-                    }
-
-                    // ── Right-side controls (right-to-left layout) ────────────
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-
-                        // Theme toggle (rightmost)
-                        let is_dark = ctx.style().visuals.dark_mode;
-                        let lbl = if is_dark { "🌙" } else { "☀️" };
-                        if ui.add_sized([36.0, 28.0], Button::new(lbl))
-                            .on_hover_text("Toggle light / dark mode").clicked()
-                        {
-                            if is_dark {
-                                ctx.set_visuals(Visuals::dark());
-                            } else {
-                                let mut v = Visuals::light();
-                                v.panel_fill = Color32::from_rgb(240, 242, 245);
-                                ctx.set_visuals(v);
-                            }
-                        }
-
-                        ui.add_space(4.0);
-
-                        // ── Two-page view toggle ──────────────────────────────
-                        let two_page_lbl = if self.two_page_view {
-                            RichText::new("⬛⬛ 2-Page")
-                                .size(11.5)
-                                .color(Color32::WHITE)
-                        } else {
-                            RichText::new("⬛⬛ 2-Page").size(11.5)
-                        };
-
-                        let two_page_btn = if self.two_page_view {
-                            // Active state: filled blue button
-                            Button::new(two_page_lbl)
-                                .fill(Color32::from_rgb(49, 130, 206))
-                        } else {
-                            Button::new(two_page_lbl)
-                        };
-
-                        if ui.add_sized([84.0, 28.0], two_page_btn)
-                            .on_hover_text("Toggle two-page side-by-side view  [Ctrl+2]")
+                    ui.horizontal(|ui| {
+                        // ── "Add Current Document" — bookmarks the file only ──
+                        if ui.button("➕ Add Document")
+                            .on_hover_text("Bookmark this document (no page saved)")
                             .clicked()
                         {
-                            self.two_page_view = !self.two_page_view;
-                            // Force even page as left page (0-indexed)
-                            if self.two_page_view && self.current_page % 2 == 1 {
-                                self.current_page = self.current_page.saturating_sub(1);
+                            if let Some(tab) = self.active_tab_ref() {
+                                let title = std::path::Path::new(&tab.file_path)
+                                    .file_name().unwrap_or_default()
+                                    .to_string_lossy().to_string();
+                                let b = Bookmark::Link(LinkData {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    title,
+                                    url: tab.file_path.clone(),
+                                    page: None,
+                                    icon: None,
+                                    tags: Vec::new(),
+                                    date_added: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap().as_secs(),
+                                });
+                                self.bookmarks.add_bookmark(None, b);
+                                let _ = self.bookmarks.save_to_disk(&self.bookmarks_path);
                             }
-                            self.page_textures.clear();
                         }
 
-                        ui.add_space(4.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-
-                        // File name (fills remaining space, centred)
-                        ui.centered_and_justified(|ui| {
-                            ui.label(RichText::new(self.pdf_name())
-                                .size(14.0).strong()
-                                .color(if ctx.style().visuals.dark_mode {
-                                    Color32::from_rgb(200, 210, 230)
-                                } else {
-                                    Color32::from_rgb(40, 60, 100)
-                                })
-                            );
-                        });
+                        // ── "Bookmark Page" — bookmarks file + current page ───
+                        if ui.button("📌 Bookmark Page")
+                            .on_hover_text("Bookmark this document at the current page")
+                            .clicked()
+                        {
+                            if let Some(tab) = self.active_tab_ref() {
+                                let current_page = tab.current_page;
+                                let title = format!(
+                                    "{} (p.{})",
+                                    std::path::Path::new(&tab.file_path)
+                                        .file_name().unwrap_or_default()
+                                        .to_string_lossy(),
+                                    current_page + 1,
+                                );
+                                let b = Bookmark::Link(LinkData {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    title,
+                                    url: tab.file_path.clone(),
+                                    page: Some(current_page),
+                                    icon: None,
+                                    tags: Vec::new(),
+                                    date_added: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap().as_secs(),
+                                });
+                                self.bookmarks.add_bookmark(None, b);
+                                let _ = self.bookmarks.save_to_disk(&self.bookmarks_path);
+                            }
+                        }
                     });
+
+                    ui.separator();
+
+                    let mut action = BookmarkAction::None;
+                    let bm_root = self.bookmarks.root.clone();
+                    ScrollArea::vertical()
+                        .id_salt("user_bookmarks_scroll")
+                        .show(ui, |ui| {
+                            action = Self::draw_bookmark_tree(ui, &bm_root);
+                        });
+
+                    match action {
+                        BookmarkAction::Load(url, maybe_page) => {
+                            // If the file is already open in a tab, just switch to it
+                            // (and jump to the page if requested).
+                            let already_open = self.tabs
+                                .iter()
+                                .find(|t| t.file_path == url)
+                                .map(|t| t.id);
+
+                            if let Some(tid) = already_open {
+                                self.active_tab_id = Some(tid);
+                                if let Some(pg) = maybe_page {
+                                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tid) {
+                                        if pg < tab.page_count() {
+                                            tab.current_page = pg;
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Record the desired jump so WorkerResponse::Loaded can apply it.
+                                if let Some(pg) = maybe_page {
+                                    self.pending_page_jump = Some((url.clone(), pg));
+                                }
+                                self.load_file(&url, ctx);
+                            }
+                        }
+                        BookmarkAction::GoToPage(page) => {
+                            if let Some(tab) = self.active_tab() {
+                                if page < tab.page_count() {
+                                    tab.current_page = page;
+                                }
+                            }
+                        }
+                        BookmarkAction::Delete(id) => {
+                            self.bookmarks.delete_bookmark(&id);
+                            let _ = self.bookmarks.save_to_disk(&self.bookmarks_path);
+                        }
+                        BookmarkAction::None => {}
+                    }
                 });
+        }
 
-                ui.add_space(4.0);
-            });
-
-        // ── Ctrl+2 shortcut for two-page toggle ─────────────────────────────────
-        ctx.input(|i| {
-            if i.modifiers.ctrl && i.key_pressed(Key::Num2) {
-                self.two_page_view = !self.two_page_view;
-                if self.two_page_view && self.current_page % 2 == 1 {
-                    self.current_page = self.current_page.saturating_sub(1);
-                }
-                self.page_textures.clear();
-            }
-        });
-
-        // ── LEFT TOOLBAR ──────────────────────────────────────────────────────
-        SidePanel::left("toolbar").exact_width(68.0).show(ctx, |ui| {
+        // ── Left toolbar ──────────────────────────────────────────────────────
+        SidePanel::left("toolbar")
+            .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill).stroke(egui::Stroke::NONE))
+            .exact_width(72.0)
+            .show(ctx, |ui| {
             draw_toolbar(ui, &mut self.tool_state);
         });
 
-        // ── RIGHT THUMBNAIL PANEL (lazy) ──────────────────────────────────────
+        // ── Right thumbnails ──────────────────────────────────────────────────
         SidePanel::right("thumbnails")
+            .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill).stroke(egui::Stroke::NONE))
             .resizable(true)
             .min_width(130.0)
             .max_width(200.0)
             .show(ctx, |ui| {
-                let total = self.page_count();
-                if total == 0 {
-                    ui.centered_and_justified(|ui| { ui.label("No pages"); });
-                    return;
-                }
-
-                let thumb_h = 140.0_f32;
-
-                let scroll = ScrollArea::vertical()
-                    .id_salt("thumb_scroll")
-                    .show_rows(ui, thumb_h, total, |ui, range| {
-                        let center = (range.start + range.end) / 2;
-                        self.manage_thumb_cache(ctx, center);
-
-                        for i in range {
-                            // Highlight thumb if it's a search result
-                            let is_search_hit = !self.search_query.trim().is_empty()
-                                && self.search_results.contains(&i);
-                            let is_active = i == self.current_page
-                                || (self.two_page_view && Some(i) == self.right_page());
-
-                            let frame_col = if is_active {
-                                Color32::from_rgb(49, 130, 206)
-                            } else if is_search_hit {
-                                Color32::from_rgb(220, 170, 0)
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-
-                            if let Some(tex) = self.thumb_textures.get(&i) {
-                                Frame::none()
-                                    .stroke(Stroke::new(2.0, frame_col))
-                                    .inner_margin(2.0)
-                                    .show(ui, |ui| {
-                                        let r = ui.add(
-                                            Image::new(tex)
-                                                .max_width(110.0)
-                                                .sense(Sense::click())
-                                        );
-                                        // Draw a small search badge overlay on thumb
-                                        if is_search_hit {
-                                            let tr = r.rect;
-                                            let badge = Rect::from_min_size(
-                                                tr.right_top() - Vec2::new(28.0, 0.0),
-                                                Vec2::new(28.0, 16.0),
-                                            );
-                                            ui.painter().rect_filled(
-                                                badge, 3.0,
-                                                Color32::from_rgb(220, 160, 0));
-                                            ui.painter().text(
-                                                badge.center(),
-                                                Align2::CENTER_CENTER,
-                                                "🔍",
-                                                FontId::proportional(10.0),
-                                                Color32::WHITE,
-                                            );
-                                        }
-                                        if r.clicked() { self.current_page = i; }
-                                    });
-                            } else {
-                                let (rect, resp) = ui.allocate_exact_size(
-                                    Vec2::new(110.0, 120.0), Sense::click());
-                                ui.painter().rect_filled(rect, 2.0, Color32::from_gray(60));
-                                if resp.clicked() { self.current_page = i; }
-                            }
-
-                            ui.label(RichText::new(format!("Pg {}", i + 1))
-                                .size(10.0)
-                                .color(if is_active {
-                                    Color32::from_rgb(49, 130, 206)
-                                } else if is_search_hit {
-                                    Color32::from_rgb(200, 140, 0)
-                                } else {
-                                    Color32::GRAY
-                                }));
-
-                            ui.add_space(4.0);
-                        }
-                    });
-
-                self.thumb_viewport_top = (scroll.state.offset.y / thumb_h) as usize;
-            });
-
-        // ── CENTRAL CANVAS ────────────────────────────────────────────────────
-        CentralPanel::default().show(ctx, |ui| {
-
-            // Keyboard navigation (in two-page mode, advance by 2)
-            let page_count = self.page_count();
-            let step = if self.two_page_view { 2 } else { 1 };
-            ctx.input(|i| {
-                if (i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::PageDown))
-                    && self.current_page + step < page_count
-                { self.current_page += step; }
-                if (i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::PageUp))
-                    && self.current_page >= step
-                { self.current_page -= step; }
-            });
-
-            // Manage texture cache
-            self.manage_page_cache(ctx);
-
-            ScrollArea::both().id_salt("canvas_scroll").show(ui, |ui| {
-                if self.page_textures.contains_key(&self.current_page) {
-
-                    if self.two_page_view {
-                        // ── Two-page side-by-side layout ──────────────────
-                        let right_page = self.right_page();
-
-                        // Use a horizontal layout with a gap between the two pages
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-
-                            // Left page (current_page)
-                            let left_idx = self.current_page;
-                            let left_id  = Id::new(("pdf_left", left_idx));
-                            self.draw_page_canvas(ui, left_idx, left_id, ctx);
-
-                            ui.add_space(TWO_PAGE_GAP);
-
-                            // Right page (current_page + 1)
-                            if let Some(right_idx) = right_page {
-                                if self.page_textures.contains_key(&right_idx) {
-                                    let right_id = Id::new(("pdf_right", right_idx));
-                                    self.draw_page_canvas(ui, right_idx, right_id, ctx);
-                                } else {
-                                    // Placeholder while right page renders
-                                    let ph_size = self.page_textures
-                                        .get(&left_idx)
-                                        .map(|c| c.texture.size_vec2())
-                                        .unwrap_or(Vec2::new(400.0, 560.0));
-                                    let (rect, _) = ui.allocate_exact_size(ph_size, Sense::hover());
-                                    ui.painter().rect_filled(rect, 2.0,
-                                        Color32::from_gray(if ctx.style().visuals.dark_mode { 40 } else { 220 }));
-                                }
-                            } else {
-                                // Last odd-numbered page — show blank placeholder
-                                let ph_size = self.page_textures
-                                    .get(&left_idx)
-                                    .map(|c| c.texture.size_vec2())
-                                    .unwrap_or(Vec2::new(400.0, 560.0));
-                                let (rect, _) = ui.allocate_exact_size(ph_size, Sense::hover());
-                                ui.painter().rect_filled(rect, 2.0,
-                                    Color32::from_gray(if ctx.style().visuals.dark_mode { 30 } else { 230 }));
-                                ui.painter().text(
-                                    rect.center(), Align2::CENTER_CENTER,
-                                    "—",
-                                    FontId::proportional(28.0),
-                                    Color32::from_gray(120),
-                                );
-                            }
-
-                            ui.add_space(8.0);
-                        });
-
-                        // Page label strip below the two pages
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-                            let left_lbl = format!("Page {}", self.current_page + 1);
-                            ui.add_sized([200.0, 16.0],
-                                Label::new(RichText::new(left_lbl).size(11.0).color(Color32::GRAY)));
-                            ui.add_space(TWO_PAGE_GAP);
-                            if let Some(r) = right_page {
-                                let right_lbl = format!("Page {}", r + 1);
-                                ui.add_sized([200.0, 16.0],
-                                    Label::new(RichText::new(right_lbl).size(11.0).color(Color32::GRAY)));
-                            }
-                        });
-
+                if let Some(tab) = self.tabs.iter_mut().find(|t| Some(t.id) == self.active_tab_id) {
+                    let total = tab.page_count();
+                    if total == 0 {
+                        ui.centered_and_justified(|ui| { ui.label("No pages"); });
                     } else {
-                        // ── Single-page layout ─────────────────────────────
-                        let page_idx = self.current_page;
-                        let page_id  = Id::new("pdf_canvas");
-                        self.draw_page_canvas(ui, page_idx, page_id, ctx);
+                        let thumb_h = 140.0_f32;
+                        ScrollArea::vertical()
+                            .id_salt("thumb_scroll")
+                            .show_rows(ui, thumb_h, total, |ui, range| {
+                                let center = (range.start + range.end) / 2;
+                                tab.manage_thumb_cache(center, &self.worker_tx);
+
+                                for i in range {
+                                    let is_search_hit = !tab.search_query.trim().is_empty()
+                                        && tab.search_results.contains(&i);
+                                    let is_active = i == tab.current_page
+                                        || (tab.two_page_view && Some(i) == tab.right_page());
+
+                                    let frame_col = if is_active {
+                                        Color32::from_rgb(49, 130, 206)
+                                    } else if is_search_hit {
+                                        Color32::from_rgb(220, 170, 0)
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    };
+
+                                    if let Some(tex) = tab.thumb_textures.get(&i) {
+                                        Frame::none()
+                                            .stroke(Stroke::new(2.0, frame_col))
+                                            .inner_margin(2.0)
+                                            .show(ui, |ui| {
+                                                let r = ui.add(Image::new(tex).max_width(110.0).sense(Sense::click()));
+                                                if is_search_hit {
+                                                    let br = Rect::from_center_size(
+                                                        r.rect.right_top() + Vec2::new(-8.0, 8.0),
+                                                        Vec2::splat(16.0));
+                                                    ui.painter().circle_filled(br.center(), 8.0, Color32::from_rgb(220, 170, 0));
+                                                    ui.painter().text(br.center(), Align2::CENTER_CENTER, "🔍",
+                                                        FontId::proportional(10.0), Color32::WHITE);
+                                                }
+                                                if r.clicked() {
+                                                    tab.current_page = if tab.two_page_view { i & !1 } else { i };
+                                                }
+                                            });
+                                    } else {
+                                        let dummy = Rect::from_min_size(ui.cursor().min, Vec2::new(110.0, 140.0));
+                                        ui.allocate_rect(dummy, Sense::hover());
+                                        ui.painter().rect_filled(dummy, 2.0,
+                                            Color32::from_gray(if ui.visuals().dark_mode { 40 } else { 220 }));
+                                        ui.painter().text(dummy.center(), Align2::CENTER_CENTER, "Loading…",
+                                            FontId::proportional(12.0), Color32::GRAY);
+                                    }
+                                    ui.add_space(8.0);
+                                }
+                            });
                     }
                 } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("📂  Open a PDF to get started").size(18.0));
-                    });
+                    ui.centered_and_justified(|ui| { ui.label("No active tab"); });
                 }
             });
+
+        // ── Central canvas ────────────────────────────────────────────────────
+        CentralPanel::default()
+            .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill))
+            .show(ctx, |ui| {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| Some(t.id) == self.active_tab_id) {
+                tab.manage_page_cache(&self.worker_tx);
+            }
+
+            if self.active_tab_id.is_none() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new("No document open").size(24.0).color(Color32::DARK_GRAY));
+                });
+                return;
+            }
+
+            let mut commit_note = None;
+            let mut close_note  = false;
+            let mut commit_text = None;
+            let mut close_text  = false;
+
+            ScrollArea::both()
+                .auto_shrink([false, false])
+                .id_salt("main_scroll")
+                .show(ui, |ui| {
+                    let mut total_w = 0.0;
+                    if let Some(tab) = self.active_tab_ref() {
+                        let cur   = tab.current_page;
+                        let right = tab.right_page();
+                        let gap   = crate::tab::TWO_PAGE_GAP * tab.scale;
+                        if cur < tab.page_sizes.len() {
+                            let (w, _) = tab.page_sizes[cur];
+                            total_w += w * tab.scale;
+                        }
+                        if let Some(r) = right {
+                            if r < tab.page_sizes.len() {
+                                let (w, _) = tab.page_sizes[r];
+                                total_w += w * tab.scale + gap;
+                            }
+                        }
+                    }
+
+                    let avail_w = ui.available_width();
+                    let padding = if avail_w > total_w { (avail_w - total_w) / 2.0 } else { 0.0 };
+
+                    ui.vertical(|ui| {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if padding > 0.0 { ui.add_space(padding); }
+
+                            let (cur, right, gap) = if let Some(tab) = self.active_tab_ref() {
+                                (tab.current_page, tab.right_page(), crate::tab::TWO_PAGE_GAP * tab.scale)
+                            } else {
+                                (0, None, 0.0)
+                            };
+
+                            if right.is_some() {
+                                if let Some(tab) = self.tabs.iter_mut().find(|t| Some(t.id) == self.active_tab_id) {
+                                    draw_tab_canvas(tab, &mut self.tool_state, &mut self.note_modal, &mut self.text_modal, ui, cur, Id::new(cur), ctx);
+                                }
+                                ui.add_space(gap);
+                                if let Some(tab) = self.tabs.iter_mut().find(|t| Some(t.id) == self.active_tab_id) {
+                                    draw_tab_canvas(tab, &mut self.tool_state, &mut self.note_modal, &mut self.text_modal, ui, cur + 1, Id::new(cur + 1), ctx);
+                                }
+                            } else if let Some(tab) = self.tabs.iter_mut().find(|t| Some(t.id) == self.active_tab_id) {
+                                draw_tab_canvas(tab, &mut self.tool_state, &mut self.note_modal, &mut self.text_modal, ui, cur, Id::new(cur), ctx);
+                            }
+                        });
+                        ui.add_space(8.0);
+                    });
+
+                    // Modals
+                    if self.note_modal.open {
+                        egui::Window::new("Enter Note").collapsible(false).resizable(false)
+                            .show(ctx, |ui| {
+                                ui.text_edit_multiline(&mut self.note_modal.text);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Save").clicked()   { commit_note = Some(self.note_modal.text.clone()); close_note = true; }
+                                    if ui.button("Cancel").clicked() { close_note = true; }
+                                });
+                            });
+                    }
+                    if self.text_modal.open {
+                        egui::Window::new("Text Options").collapsible(false).resizable(false)
+                            .show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Size:");
+                                    ui.add(egui::Slider::new(&mut self.text_modal.font_size, 8.0..=72.0));
+                                });
+                                let res = ui.text_edit_multiline(&mut self.text_modal.text);
+                                res.request_focus();
+                                ui.horizontal(|ui| {
+                                    if ui.button("Place Text").clicked() { commit_text = Some((self.text_modal.text.clone(), self.text_modal.font_size)); close_text = true; }
+                                    if ui.button("Cancel").clicked()     { close_text = true; }
+                                });
+                            });
+                    }
+                });
+
+            if close_note { self.note_modal.open = false; }
+            if close_text { self.text_modal.open = false; }
+
+            // Commit note
+            if let Some(text) = commit_note {
+                let tab_id = self.note_modal.tab_id;
+                if let Some(id) = tab_id {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                        tab.doc.add_annot(self.note_modal.page,
+                            AnnotationShape::Note(StickyNote {
+                                pos: [self.note_modal.pos.x, self.note_modal.pos.y],
+                                text,
+                            }));
+                    }
+                }
+                self.note_modal.text.clear();
+            }
+
+            // Commit text box
+            if let Some((text, font_size)) = commit_text {
+                if !text.trim().is_empty() {
+                    let tab_id = self.text_modal.tab_id;
+                    if let Some(id) = tab_id {
+                        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                            tab.doc.add_annot(self.text_modal.page,
+                                AnnotationShape::TextBox(TextBox {
+                                    pos: [self.text_modal.pos.x, self.text_modal.pos.y],
+                                    text, font_size,
+                                    color: color32_to_arr(self.tool_state.color),
+                                }));
+                        }
+                    }
+                }
+                self.text_modal.text.clear();
+            }
         });
 
-        // ── Note modal ─────────────────────────────────────────────────────────
-        if self.note_modal.open {
-            Window::new("📝 Add Note").collapsible(false).resizable(false)
-                .show(ctx, |ui| {
-                    ui.label("Note text:");
-                    ui.text_edit_multiline(&mut self.note_modal.text);
-                    ui.horizontal(|ui| {
-                        if ui.button("Save Note").clicked() {
-                            self.annots.add_annot(self.note_modal.page,
-                                Annot::Note(StickyNote {
-                                    pos: [self.note_modal.pos.x, self.note_modal.pos.y],
-                                    text: self.note_modal.text.clone(),
-                                }));
-                            self.note_modal.open = false;
-                            self.show_toast("Note added — hover with Cursor to view", ctx);
-                        }
-                        if ui.button("Cancel").clicked() { self.note_modal.open = false; }
-                    });
-                });
+        // Reset undo checkpoint flag at end of frame
+        for tab in &mut self.tabs {
+            tab.needs_undo_checkpoint = false;
         }
 
-        // ── Text modal ─────────────────────────────────────────────────────────
-        if self.text_modal.open {
-            Window::new("T  Add Text").collapsible(false).resizable(false)
-                .show(ctx, |ui| {
-                    ui.label("Text:");
-                    ui.text_edit_multiline(&mut self.text_modal.text);
-                    ui.horizontal(|ui| {
-                        ui.label("Size:");
-                        ui.add(DragValue::new(&mut self.text_modal.font_size).range(6.0..=72.0));
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Place").clicked() {
-                            let color = color32_to_arr(self.tool_state.color);
-                            self.annots.add_annot(self.text_modal.page,
-                                Annot::TextBox(crate::annotations::TextBox {
-                                    pos: [self.text_modal.pos.x, self.text_modal.pos.y],
-                                    text: self.text_modal.text.clone(),
-                                    color, font_size: self.text_modal.font_size,
-                                }));
-                            self.text_modal.open = false;
-                            self.show_toast("Text placed!", ctx);
-                        }
-                        if ui.button("Cancel").clicked() { self.text_modal.open = false; }
-                    });
-                });
-        }
-
-        // ── Toast ──────────────────────────────────────────────────────────────
+        // ── Toast ─────────────────────────────────────────────────────────────
         if let Some(toast) = &self.toast {
             if toast.is_alive(ctx) {
-                Area::new(Id::new("toast")).anchor(Align2::CENTER_BOTTOM, [0.0, -30.0])
+                egui::Window::new("Toast")
+                    .title_bar(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_BOTTOM, [0.0, -40.0])
                     .show(ctx, |ui| {
-                        Frame::dark_canvas(ui.style()).inner_margin(10.0).show(ui, |ui| {
-                            ui.label(RichText::new(&toast.text).size(14.0));
-                        });
+                        Frame::none()
+                            .fill(Color32::from_black_alpha(200))
+                            .rounding(4.0)
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(&toast.text).color(Color32::WHITE));
+                            });
                     });
-                ctx.request_repaint();
             } else {
                 self.toast = None;
             }
         }
+
+        // ── Conversion modal ──────────────────────────────────────────────────
+        if let ConversionState::Converting(path) = &self.conversion_state {
+            egui::Window::new("Document Conversion")
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .collapsible(false)
+                .resizable(false)
+                .auto_sized()
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(10.0);
+                        ui.add(egui::widgets::Spinner::new().size(32.0));
+                        ui.add_space(16.0);
+                        ui.label(RichText::new("Converting to PDF…").strong().size(16.0));
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(format!("File: {}", path)).weak());
+                        ui.add_space(10.0);
+                        ui.label("This may take a few seconds.");
+                        ui.add_space(10.0);
+                    });
+                });
+        }
+
+
+
+        crate::ui::draw_shortcut_settings(ctx, &mut self.tool_state);
+    }
+}
+
+impl Drop for IkraApp {
+    fn drop(&mut self) {
+        let _ = self.tool_state.save_to_disk(&self.settings_path);
     }
 }

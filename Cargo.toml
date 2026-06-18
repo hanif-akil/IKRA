@@ -1,32 +1,32 @@
 [package]
-name        = "ikra-pdf-editor"
-version     = "0.1.0"
-edition     = "2021"
-description = "A PDF editor built with Rust"
-authors     = ["hanif-akil"]
-license     = "MIT"
+name = "ikra-pdf-editor"
+version = "2.0.0"
+edition = "2024"
+authors = ["Your Name <you@example.com>"]
+description = "Professional PDF Editor built with Rust"
+license = "MIT"
 
 [[bin]]
 name = "ikra"
 path = "src/main.rs"
 
-[dependencies]
-eframe = { version = "0.29", features = ["default_fonts", "wgpu"] }
-egui = "0.29"
-pdfium-render = { version = "0.8", features = ["image", "thread_safe"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
-rfd = "0.14"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-lopdf = "0.32"
-uuid = { version = "1", features = ["v4"] }
+# ... (Keep your dependencies here) ...
+
+[package.metadata.deb]
+maintainer = "Your Name <you@example.com>"
+assets = [
+    ["target/release/ikra", "usr/bin/ikra", "755"],
+    ["assets/ikra.png", "usr/share/pixmaps/ikra.png", "644"]
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/ikra", dest = "/usr/bin/ikra", mode = "755" },
+    { source = "assets/ikra.png", dest = "/usr/share/pixmaps/ikra.png", mode = "644" }
+]
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-strip = true
-
-[profile.dev]
-opt-level = 1
-debug = true
+strip = true # Automatically strips the binary, making manual `strip` steps redundant
