@@ -2,7 +2,7 @@
 name = "ikra-pdf-editor"
 version = "2.0.0"
 edition = "2024"
-authors = ["Your Name <you@example.com>"]
+authors = ["Md Abu Hanif>"]
 description = "Professional PDF Editor built with Rust"
 license = "MIT"
 
@@ -10,10 +10,26 @@ license = "MIT"
 name = "ikra"
 path = "src/main.rs"
 
-# ... (Keep your dependencies here) ...
+[dependencies]
+eframe = { version = "0.29", features = ["default_fonts", "wgpu"] }
+egui = "0.29"
+pdfium-render = { version = "0.8", features = ["image", "thread_safe"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lopdf = "0.32"
+uuid = { version = "1", features = ["v4"] }
+lazy_static = "1.5.0"
+rayon = "1.8"
+egui_extras = { version = "0.29", features = ["svg", "image"] }
+
+[build-dependencies]
+winres = "0.1"
+
 
 [package.metadata.deb]
-maintainer = "Your Name <you@example.com>"
+maintainer = "Md Abu Hanif>"
 assets = [
     ["target/release/ikra", "usr/bin/ikra", "755"],
     ["assets/ikra.png", "usr/share/pixmaps/ikra.png", "644"]
